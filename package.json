@@ -1,0 +1,37 @@
+{
+  "name": "nerva",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Nerva: the operating system for AI-powered companies.",
+  "scripts": {
+    "setup": "npm run api:setup && npm run web:install",
+    "db:up": "docker compose up -d --wait postgres",
+    "db:down": "docker compose down",
+    "db:reset": "docker compose down -v && npm run db:up && npm run api:migrate",
+    "db:logs": "docker compose logs -f postgres",
+    "api:setup": "node scripts/api.mjs setup",
+    "api:dev": "node scripts/api.mjs dev",
+    "api:test": "node scripts/api.mjs test",
+    "api:lint": "node scripts/api.mjs lint",
+    "api:format": "node scripts/api.mjs format",
+    "api:typecheck": "node scripts/api.mjs typecheck",
+    "api:migrate": "node scripts/api.mjs migrate",
+    "api:revision": "node scripts/api.mjs revision -m",
+    "web:install": "npm --prefix apps/web install",
+    "web:dev": "npm --prefix apps/web run dev",
+    "web:build": "npm --prefix apps/web run build",
+    "web:start": "npm --prefix apps/web run start",
+    "web:test": "npm --prefix apps/web run test",
+    "web:lint": "npm --prefix apps/web run lint",
+    "web:format": "npm --prefix apps/web run format",
+    "web:typecheck": "npm --prefix apps/web run typecheck",
+    "lint": "npm run api:lint && npm run web:lint && npm run web:format:check",
+    "typecheck": "npm run api:typecheck && npm run web:typecheck",
+    "test": "npm run api:test && npm run web:test",
+    "check": "npm run lint && npm run typecheck && npm run test && npm run web:build",
+    "web:format:check": "npm --prefix apps/web run format:check"
+  },
+  "engines": {
+    "node": ">=20.9"
+  }
+}
