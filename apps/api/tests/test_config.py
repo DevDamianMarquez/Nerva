@@ -18,3 +18,11 @@ def test_the_session_cookie_requires_https_only_in_production() -> None:
     assert Settings(environment="local").cookie_secure is False
     assert Settings(environment="test").cookie_secure is False
     assert Settings(environment="production").cookie_secure is True
+
+
+def test_ai_provider_is_not_configured_without_an_api_key() -> None:
+    assert Settings(openai_api_key="").ai_provider_configured is False
+
+
+def test_ai_provider_is_configured_once_an_api_key_is_set() -> None:
+    assert Settings(openai_api_key="sk-test").ai_provider_configured is True

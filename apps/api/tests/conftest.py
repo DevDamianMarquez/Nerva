@@ -17,12 +17,13 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
 import nerva.models  # noqa: F401  (registers tables on Base.metadata)
-from nerva.api.deps import get_gmail_client, get_google_oauth_client
+from nerva.api.deps import get_ai_client, get_gmail_client, get_google_oauth_client
 from nerva.app import create_app
 from nerva.core.config import Settings, get_settings
 from nerva.core.security import SESSION_COOKIE_NAME
 from nerva.db.base import Base
 from nerva.db.session import get_session
+from tests.fakes.ai import FakeAIClient
 from tests.fakes.google import FakeGmailClient, FakeGoogleOAuthClient
 from tests.helpers import Account, ensure_database
 
@@ -79,10 +80,19 @@ def gmail_client() -> FakeGmailClient:
 
 
 @pytest.fixture
+def ai_client() -> FakeAIClient:
+    """Stands in for an LLM provider. Set `.next_result` / `.fail_with` /
+    `.model_id` in a test to script a specific scenario. No test using this
+    fixture ever makes a real network call — see `tests/fakes/ai.py`."""
+    return FakeAIClient()
+
+
+@pytest.fixture
 def client(
     db_session: Session,
     google_oauth_client: FakeGoogleOAuthClient,
     gmail_client: FakeGmailClient,
+    ai_client: FakeAIClient,
 ) -> Iterator[TestClient]:
     app = create_app(Settings(environment="test"))
 
@@ -95,6 +105,7 @@ def client(
     app.dependency_overrides[get_session] = override_session
     app.dependency_overrides[get_google_oauth_client] = lambda: google_oauth_client
     app.dependency_overrides[get_gmail_client] = lambda: gmail_client
+    app.dependency_overrides[get_ai_client] = lambda: ai_client
     with TestClient(app) as test_client:
         yield test_client
 

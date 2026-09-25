@@ -2,8 +2,14 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { api } from "@/lib/api-client";
-import type { GoogleConnectResponse, Integration, Member, SyncResult } from "@/lib/types";
+import { api, ApiError } from "@/lib/api-client";
+import type {
+  AnalysisBackfillResult,
+  GoogleConnectResponse,
+  Integration,
+  Member,
+  SyncResult,
+} from "@/lib/types";
 
 import { SettingsView } from "./settings-view";
 
@@ -32,9 +38,13 @@ vi.mock("next/navigation", () => ({
 vi.mock("@/lib/api-client", () => {
   class MockApiError extends Error {
     status: number;
-    constructor(status: number, message: string) {
+    code: string;
+    details: unknown;
+    constructor(status: number, code: string, message: string, details?: unknown) {
       super(message);
       this.status = status;
+      this.code = code;
+      this.details = details;
     }
   }
   return { api: { get: vi.fn(), post: vi.fn() }, ApiError: MockApiError };
@@ -216,5 +226,85 @@ describe("SettingsView", () => {
     expect(
       await screen.findByText(/connection link expired or was already used/i),
     ).toBeInTheDocument();
+  });
+
+  describe("AI Understanding", () => {
+    it("runs a bounded analysis batch and shows the result summary", async () => {
+      mockData([member], []);
+      mockedApi.post.mockResolvedValue({
+        considered: 12,
+        analyzed: 4,
+        cached: 7,
+        failed: 1,
+        signals_created: 2,
+      } satisfies AnalysisBackfillResult);
+
+      render(<SettingsView />);
+      const section = await screen.findByRole("region", { name: "AI Understanding" });
+      await userEvent.click(within(section).getByRole("button", { name: "Run analysis" }));
+
+      expect(mockedApi.post).toHaveBeenCalledWith("/v1/workspaces/w1/analysis/backfill");
+      expect(
+        await screen.findByText(
+          "Analyzed 4 conversations. 7 already up to date. 1 failed. 2 potential opportunities found.",
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it("shows honest copy when nothing needed analysis", async () => {
+      mockData([member], []);
+      mockedApi.post.mockResolvedValue({
+        considered: 0,
+        analyzed: 0,
+        cached: 0,
+        failed: 0,
+        signals_created: 0,
+      } satisfies AnalysisBackfillResult);
+
+      render(<SettingsView />);
+      await userEvent.click(await screen.findByRole("button", { name: "Run analysis" }));
+
+      expect(
+        await screen.findByText("Everything is already up to date. Nothing needed analysis."),
+      ).toBeInTheDocument();
+    });
+
+    it("shows a safe error message when the backfill fails", async () => {
+      mockData([member], []);
+      mockedApi.post.mockRejectedValue(
+        new ApiError(503, "service_unavailable", "AI analysis is not available right now.", {
+          code: "ai_not_configured",
+        }),
+      );
+
+      render(<SettingsView />);
+      await userEvent.click(await screen.findByRole("button", { name: "Run analysis" }));
+
+      expect(
+        await screen.findByText("AI analysis is not available right now."),
+      ).toBeInTheDocument();
+    });
+
+    it("disables the button and shows a loading label while the batch runs", async () => {
+      mockData([member], []);
+      let resolveBackfill: (value: AnalysisBackfillResult) => void = () => {};
+      mockedApi.post.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolveBackfill = resolve;
+          }),
+      );
+
+      render(<SettingsView />);
+      const button = await screen.findByRole("button", { name: "Run analysis" });
+      await userEvent.click(button);
+
+      expect(await screen.findByRole("button", { name: "Analyzing…" })).toBeDisabled();
+
+      resolveBackfill({ considered: 0, analyzed: 0, cached: 0, failed: 0, signals_created: 0 });
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Run analysis" })).toBeEnabled(),
+      );
+    });
   });
 });

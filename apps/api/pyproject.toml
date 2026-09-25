@@ -25,6 +25,10 @@ dependencies = [
     # google-auth's own HTTP transport for fetching Google's public certs during
     # ID-token verification; required by google.auth.transport.requests.
     "requests>=2.32",
+    # Nerva AI: the real AIAnalysisClient (nerva_ai/providers/openai.py) only —
+    # never imported outside that one module. Structured Outputs (response_format=
+    # a Pydantic model) needs a reasonably current SDK.
+    "openai>=1.54",
 ]
 
 [project.optional-dependencies]

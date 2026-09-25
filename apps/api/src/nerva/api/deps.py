@@ -13,6 +13,9 @@ from nerva.core.errors import AuthenticationError
 from nerva.core.security import SESSION_COOKIE_NAME
 from nerva.db.session import get_session
 from nerva.models import User
+from nerva.nerva_ai.client import AIAnalysisClient
+from nerva.nerva_ai.providers.openai import OpenAIProvider
+from nerva.nerva_ai.unconfigured import UnconfiguredAIClient
 from nerva.nerva_connect.google.gmail import GmailClient
 from nerva.nerva_connect.google.oauth import GoogleOAuthClient
 from nerva.services.auth import AuthService
@@ -69,6 +72,18 @@ def get_gmail_client() -> GmailClient:
 
 
 GmailClientDep = Annotated[GmailClient, Depends(get_gmail_client)]
+
+
+def get_ai_client(settings: SettingsDep) -> AIAnalysisClient:
+    """Returns the real OpenAI-backed client once `OPENAI_API_KEY` is set;
+    otherwise every call fails safely and explicitly rather than faking a
+    result — see `nerva.nerva_ai.unconfigured`."""
+    if settings.ai_provider_configured:
+        return OpenAIProvider(settings)
+    return UnconfiguredAIClient()
+
+
+AIClientDep = Annotated[AIAnalysisClient, Depends(get_ai_client)]
 
 
 @dataclass

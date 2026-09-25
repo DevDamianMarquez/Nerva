@@ -19,8 +19,10 @@ API_DIR = Path(__file__).resolve().parents[1]
 EXPECTED_TABLES = {
     "actions",
     "activity_events",
+    "business_signals",
     "companies",
     "contacts",
+    "conversation_analyses",
     "conversations",
     "integrations",
     "memories",

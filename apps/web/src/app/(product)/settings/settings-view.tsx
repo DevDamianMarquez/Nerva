@@ -13,7 +13,13 @@ import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { api, ApiError } from "@/lib/api-client";
 import { useAuth } from "@/lib/auth-context";
-import type { GoogleConnectResponse, Integration, Member, SyncResult } from "@/lib/types";
+import type {
+  AnalysisBackfillResult,
+  GoogleConnectResponse,
+  Integration,
+  Member,
+  SyncResult,
+} from "@/lib/types";
 
 type LoadState = "loading" | "ready" | "error";
 
@@ -203,6 +209,71 @@ function GmailIntegration({
   );
 }
 
+function summarizeBackfillResult(result: AnalysisBackfillResult): string {
+  if (result.considered === 0) {
+    return "Everything is already up to date. Nothing needed analysis.";
+  }
+  const parts = [
+    `Analyzed ${result.analyzed} ${result.analyzed === 1 ? "conversation" : "conversations"}.`,
+  ];
+  if (result.cached > 0) {
+    parts.push(`${result.cached} already up to date.`);
+  }
+  if (result.failed > 0) {
+    parts.push(`${result.failed} failed.`);
+  }
+  if (result.signals_created > 0) {
+    const noun = result.signals_created === 1 ? "opportunity" : "opportunities";
+    parts.push(`${result.signals_created} potential ${noun} found.`);
+  }
+  return parts.join(" ");
+}
+
+function AiUnderstanding({ workspaceId }: { workspaceId: string }) {
+  const [running, setRunning] = useState(false);
+  const [result, setResult] = useState<AnalysisBackfillResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const run = async () => {
+    setRunning(true);
+    setError(null);
+    setResult(null);
+    try {
+      const backfillResult = await api.post<AnalysisBackfillResult>(
+        `/v1/workspaces/${workspaceId}/analysis/backfill`,
+      );
+      setResult(backfillResult);
+    } catch (err) {
+      setError(
+        err instanceof ApiError ? err.message : "Could not run analysis. Try again shortly.",
+      );
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div className="max-w-xl space-y-3">
+      <p className="text-muted-foreground">
+        Nerva can read your imported conversations to summarize them and surface potential
+        opportunities. Each run analyzes a bounded batch — run it again if more remain.
+      </p>
+      <Button variant="outline" onClick={() => void run()} disabled={running}>
+        {running ? "Analyzing…" : "Run analysis"}
+      </Button>
+      {error ? (
+        <p role="alert" className="text-destructive">
+          {error}
+        </p>
+      ) : result ? (
+        <p role="status" className="text-muted-foreground">
+          {summarizeBackfillResult(result)}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 export function SettingsView() {
   const { workspace } = useAuth();
   const router = useRouter();
@@ -357,6 +428,16 @@ export function SettingsView() {
           Nerva only requests read-only Gmail access. It cannot send, delete or change anything in
           your mailbox.
         </p>
+      </SettingsSection>
+
+      <Separator />
+
+      <SettingsSection
+        id="ai-understanding"
+        title="AI Understanding"
+        description="How Nerva reads and makes sense of your conversations."
+      >
+        <AiUnderstanding workspaceId={workspace.id} />
       </SettingsSection>
     </PageContainer>
   );

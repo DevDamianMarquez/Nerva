@@ -94,3 +94,63 @@ class ActivityEventType(StrEnum):
     INTEGRATION_SYNCED = "integration.synced"
     INTEGRATION_DISCONNECTED = "integration.disconnected"
     INTEGRATION_NEEDS_REAUTH = "integration.needs_reauth"
+    CONVERSATION_ANALYZED = "conversation.analyzed"
+    CONVERSATION_ANALYSIS_FAILED = "conversation.analysis_failed"
+    BUSINESS_SIGNAL_CREATED = "business_signal.created"
+    BUSINESS_SIGNAL_CONFIRMED = "business_signal.confirmed"
+    BUSINESS_SIGNAL_DISMISSED = "business_signal.dismissed"
+
+
+class AnalysisStatus(StrEnum):
+    """Lifecycle of one conversation's current AI analysis attempt."""
+
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class ConversationCategory(StrEnum):
+    """A closed, deterministic-rules-facing classification the model must always
+    pick one of (unlike `intent`, which stays free text — see nerva_ai.schemas)."""
+
+    SALES_LEAD = "sales_lead"
+    CUSTOMER_SUPPORT = "customer_support"
+    BILLING = "billing"
+    PROJECT = "project"
+    INTERNAL = "internal"
+    VENDOR = "vendor"
+    RECRUITING = "recruiting"
+    SPAM = "spam"
+    OTHER = "other"
+
+
+class ConversationPriority(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    URGENT = "urgent"
+
+
+class SentimentLabel(StrEnum):
+    POSITIVE = "positive"
+    NEUTRAL = "neutral"
+    NEGATIVE = "negative"
+    MIXED = "mixed"
+
+
+class BusinessSignalType(StrEnum):
+    """A closed kind of deterministic, human-decidable conclusion Nerva can
+    derive from a completed analysis. One value in Milestone 4; a future kind
+    (e.g. "duplicate contact detected") is a migration, not a new table — see
+    `nerva.models.signals`."""
+
+    POTENTIAL_OPPORTUNITY = "potential_opportunity"
+
+
+class BusinessSignalStatus(StrEnum):
+    """pending -> confirmed | dismissed. Both `confirmed` and `dismissed` are
+    terminal — see `nerva_core.signal_lifecycle`."""
+
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    DISMISSED = "dismissed"

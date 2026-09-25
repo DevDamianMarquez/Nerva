@@ -2,15 +2,24 @@
 
 import { Mail } from "lucide-react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 
 import { EmptyState } from "@/components/empty-state";
+import { NervaUnderstanding } from "@/components/inbox/nerva-understanding";
 import { LoadError } from "@/components/load-error";
 import { PageContainer, PageHeader } from "@/components/page-header";
+import { PotentialOpportunityCard } from "@/components/signals/potential-opportunity-card";
 import { Button } from "@/components/ui/button";
-import { api } from "@/lib/api-client";
+import { api, ApiError } from "@/lib/api-client";
 import { useAuth } from "@/lib/auth-context";
-import type { Conversation, ConversationDetail, Integration } from "@/lib/types";
+import type {
+  BusinessSignal,
+  Conversation,
+  ConversationAnalysis,
+  ConversationDetail,
+  Integration,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type LoadState = "loading" | "ready" | "error";
@@ -74,11 +83,23 @@ function ConversationList({
 function ConversationDetailPane({
   state,
   detail,
+  signal,
+  analyzing,
+  analyzeError,
+  onAnalyze,
+  onConfirmSignal,
+  onDismissSignal,
   onBack,
   onRetry,
 }: {
   state: LoadState;
   detail: ConversationDetail | null;
+  signal: BusinessSignal | null;
+  analyzing: boolean;
+  analyzeError: string | null;
+  onAnalyze: () => void;
+  onConfirmSignal: (signal: BusinessSignal) => Promise<void>;
+  onDismissSignal: (signal: BusinessSignal) => Promise<void>;
   onBack: () => void;
   onRetry: () => void;
 }) {
@@ -103,6 +124,21 @@ function ConversationDetailPane({
         <h2 className="text-base font-semibold tracking-tight">
           {detail.conversation.subject || "(no subject)"}
         </h2>
+      </div>
+      <div className="space-y-4 p-4 sm:p-6">
+        <NervaUnderstanding
+          analysis={detail.analysis}
+          analyzing={analyzing}
+          error={analyzeError}
+          onAnalyze={onAnalyze}
+        />
+        {signal ? (
+          <PotentialOpportunityCard
+            signal={signal}
+            onConfirm={onConfirmSignal}
+            onDismiss={onDismissSignal}
+          />
+        ) : null}
       </div>
       <ul className="space-y-6 p-4 sm:p-6">
         {detail.messages.map((message) => (
@@ -133,23 +169,29 @@ function ConversationDetailPane({
 
 export function InboxView() {
   const { workspace } = useAuth();
+  const searchParams = useSearchParams();
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [hasGmail, setHasGmail] = useState(false);
   const [state, setState] = useState<LoadState>("loading");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
   const [detailState, setDetailState] = useState<LoadState>("ready");
+  const [pendingSignals, setPendingSignals] = useState<BusinessSignal[]>([]);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeError, setAnalyzeError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!workspace) return;
     setState("loading");
     try {
-      const [integrations, list] = await Promise.all([
+      const [integrations, list, signals] = await Promise.all([
         api.get<Integration[]>(`/v1/workspaces/${workspace.id}/integrations`),
         api.get<Conversation[]>(`/v1/workspaces/${workspace.id}/conversations`),
+        api.get<BusinessSignal[]>(`/v1/workspaces/${workspace.id}/signals?status=pending`),
       ]);
       setHasGmail(integrations.some((integration) => integration.status !== "disconnected"));
       setConversations(list);
+      setPendingSignals(signals);
       setState("ready");
     } catch {
       setState("error");
@@ -164,6 +206,7 @@ export function InboxView() {
     async (id: string) => {
       if (!workspace) return;
       setSelectedId(id);
+      setAnalyzeError(null);
       setDetailState("loading");
       try {
         const found = await api.get<ConversationDetail>(
@@ -177,6 +220,58 @@ export function InboxView() {
     },
     [workspace],
   );
+
+  // Today's "Needs your attention" links here as `?conversation=<id>`; open that
+  // conversation directly instead of leaving the visitor to find it themselves.
+  useEffect(() => {
+    const conversationId = searchParams.get("conversation");
+    if (!conversationId) return;
+    void Promise.resolve().then(() => selectConversation(conversationId));
+  }, [searchParams, selectConversation]);
+
+  const refreshPendingSignals = async () => {
+    if (!workspace) return;
+    try {
+      const signals = await api.get<BusinessSignal[]>(
+        `/v1/workspaces/${workspace.id}/signals?status=pending`,
+      );
+      setPendingSignals(signals);
+    } catch {
+      // Non-critical: a freshly created signal simply will not appear until the
+      // next successful load. The analysis itself already succeeded.
+    }
+  };
+
+  const analyze = async () => {
+    if (!workspace || !selectedId || analyzing) return;
+    setAnalyzing(true);
+    setAnalyzeError(null);
+    try {
+      const result = await api.post<ConversationAnalysis>(
+        `/v1/workspaces/${workspace.id}/conversations/${selectedId}/analyze`,
+      );
+      setDetail((current) => (current ? { ...current, analysis: result } : current));
+      await refreshPendingSignals();
+    } catch (err) {
+      setAnalyzeError(
+        err instanceof ApiError ? err.message : "Could not analyze this conversation.",
+      );
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  const confirmSignal = async (signal: BusinessSignal) => {
+    if (!workspace) return;
+    await api.post(`/v1/workspaces/${workspace.id}/signals/${signal.id}/confirm`);
+    setPendingSignals((current) => current.filter((s) => s.id !== signal.id));
+  };
+
+  const dismissSignal = async (signal: BusinessSignal) => {
+    if (!workspace) return;
+    await api.post(`/v1/workspaces/${workspace.id}/signals/${signal.id}/dismiss`);
+    setPendingSignals((current) => current.filter((s) => s.id !== signal.id));
+  };
 
   if (!workspace) return null;
 
@@ -248,6 +343,8 @@ export function InboxView() {
     );
   }
 
+  const currentSignal = pendingSignals.find((s) => s.conversation_id === selectedId) ?? null;
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="border-b px-4 py-4 sm:px-8 sm:py-6">
@@ -266,6 +363,12 @@ export function InboxView() {
           <ConversationDetailPane
             state={detailState}
             detail={detail}
+            signal={currentSignal}
+            analyzing={analyzing}
+            analyzeError={analyzeError}
+            onAnalyze={() => void analyze()}
+            onConfirmSignal={confirmSignal}
+            onDismissSignal={dismissSignal}
             onBack={() => setSelectedId(null)}
             onRetry={() => void selectConversation(selectedId)}
           />

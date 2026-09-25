@@ -204,6 +204,24 @@ Only `https://www.googleapis.com/auth/gmail.readonly` (plus `openid email` to id
 the account) is ever requested — Nerva cannot send, delete, or modify anything in a
 connected mailbox. See [ARCHITECTURE.md §10](docs/ARCHITECTURE.md#10-nerva-connect-google-oauth-and-gmail-import).
 
+## Connect an AI provider (optional)
+
+Nerva runs fine without this — conversation analysis just responds with "AI analysis
+is not configured on this server" until an API key is set, and nothing else in Nerva
+is affected. Connecting Gmail (above) needs no AI provider: importing and reading
+conversations works either way.
+
+1. Create an API key at [platform.openai.com](https://platform.openai.com/api-keys).
+2. Set `OPENAI_API_KEY` in `.env` and restart the API.
+
+`NERVA_AI_MODEL` (default `gpt-4o-mini`) selects the model; any OpenAI chat model
+that supports Structured Outputs works. Analysis reads only the messages of the one
+conversation being analyzed (never other conversations, and never anything from
+Gmail beyond what was already imported read-only); the model's output is parsed into
+a strictly validated schema and never trusted to create or modify a business record
+by itself — see [ARCHITECTURE.md §11](docs/ARCHITECTURE.md#11-nerva-ai-conversation-analysis)
+for the trust boundary and how a human confirms or dismisses what it finds.
+
 ## Configuration
 
 The API and Docker Compose are configured through `.env` in the repository root (see
@@ -223,6 +241,8 @@ for local development.
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | blank | Google OAuth Web Application credentials; see [Connect Gmail](#connect-gmail-optional) |
 | `GOOGLE_REDIRECT_URI` | `http://127.0.0.1:8000/v1/integrations/google/callback` | Must match the redirect URI configured in Google Cloud exactly |
 | `INTEGRATION_ENCRYPTION_KEY` | blank | Fernet key encrypting stored Gmail refresh tokens; required to connect Gmail |
+| `OPENAI_API_KEY` | blank | OpenAI API key; see [Connect an AI provider](#connect-an-ai-provider-optional) |
+| `NERVA_AI_MODEL` | `gpt-4o-mini` | Which OpenAI model conversation analysis uses |
 | `NEXT_PUBLIC_API_URL` (`apps/web/.env.local`) | `http://127.0.0.1:8000` | Where the browser sends API requests |
 
 ## Troubleshooting
@@ -255,6 +275,9 @@ for local development.
 
 ## What is not here yet
 
-Sending, replying to, deleting or modifying email (Gmail access is read-only), LLM
-providers, agents, action execution, embeddings, invitations and roles-based
-permissions are intentionally left for later milestones. See [docs/MVP.md](docs/MVP.md).
+Sending, replying to, deleting or modifying email (Gmail access is read-only),
+autonomous agents, action execution, embeddings, background/scheduled analysis,
+invitations and roles-based permissions are intentionally left for later milestones.
+A real AI provider now exists (see [Connect an AI provider](#connect-an-ai-provider-optional))
+but only ever produces a suggestion a human must confirm — it cannot create or
+change a business record by itself. See [docs/MVP.md](docs/MVP.md).

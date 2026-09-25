@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
     integration_encryption_key: str = ""
 
+    # --- Nerva AI: conversation analysis ------------------------------------------
+    # Blank until configured; see README.md for how to obtain one. Leaving it blank
+    # runs Nerva with AI analysis disabled (`UnconfiguredAIClient`; see
+    # `nerva.api.deps.get_ai_client`) rather than with a fake or best-guess result.
+    openai_api_key: str = ""
+    nerva_ai_model: str = "gpt-4o-mini"
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
@@ -50,6 +57,10 @@ class Settings(BaseSettings):
     @property
     def google_oauth_configured(self) -> bool:
         return bool(self.google_client_id and self.google_client_secret)
+
+    @property
+    def ai_provider_configured(self) -> bool:
+        return bool(self.openai_api_key)
 
 
 @lru_cache

@@ -147,7 +147,110 @@ export interface Message {
   sent_at: string;
 }
 
+// --- Nerva AI: conversation analysis and business signals ---------------------------
+
+export type AnalysisStatus = "pending" | "completed" | "failed";
+
+export type ConversationCategory =
+  | "sales_lead"
+  | "customer_support"
+  | "billing"
+  | "project"
+  | "internal"
+  | "vendor"
+  | "recruiting"
+  | "spam"
+  | "other";
+
+export type ConversationPriority = "low" | "medium" | "high" | "urgent";
+
+export type SentimentLabel = "positive" | "neutral" | "negative" | "mixed";
+
+export interface ConversationAnalysis {
+  id: string;
+  status: AnalysisStatus;
+  schema_version: number;
+  prompt_version: string;
+  provider: string;
+  model_id: string;
+  attempts: number;
+  category: ConversationCategory | null;
+  priority: ConversationPriority | null;
+  sentiment: SentimentLabel | null;
+  intent: string | null;
+  summary: string | null;
+  requires_response: boolean | null;
+  commercial_signal: boolean | null;
+  confidence: number | null;
+  estimated_value_cents: number | null;
+  value_currency: string | null;
+  value_is_explicit: boolean | null;
+  deadline_at: string | null;
+  deadline_is_explicit: boolean | null;
+  suggested_next_step: string | null;
+  mentioned_people: string[];
+  mentioned_companies: string[];
+  /** A short, safe classification — never raw provider output. */
+  last_error: string | null;
+  analyzed_at: string | null;
+  updated_at: string;
+}
+
+/** One row of `GET /conversations/attention` — a conversation whose completed
+ * analysis flagged it as needing a reply, or as high/urgent priority. */
+export interface ConversationAttention {
+  conversation_id: string;
+  subject: string | null;
+  last_message_at: string | null;
+  category: ConversationCategory | null;
+  priority: ConversationPriority | null;
+  requires_response: boolean | null;
+  summary: string | null;
+  analyzed_at: string | null;
+}
+
+export type BusinessSignalType = "potential_opportunity";
+export type BusinessSignalStatus = "pending" | "confirmed" | "dismissed";
+
+export interface BusinessSignal {
+  id: string;
+  conversation_id: string;
+  analysis_id: string;
+  type: BusinessSignalType;
+  status: BusinessSignalStatus;
+  source_fingerprint: string;
+  title: string | null;
+  summary: string | null;
+  estimated_value_cents: number | null;
+  currency: string | null;
+  value_is_explicit: boolean | null;
+  confidence: number | null;
+  confirmed_by_user_id: string | null;
+  confirmed_at: string | null;
+  dismissed_by_user_id: string | null;
+  dismissed_at: string | null;
+  created_opportunity_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** The result of confirming a signal: the response of `POST .../confirm`. */
+export interface SignalConfirmation {
+  signal: BusinessSignal;
+  opportunity: Opportunity;
+}
+
+/** The result of `POST /analysis/backfill`. */
+export interface AnalysisBackfillResult {
+  considered: number;
+  analyzed: number;
+  cached: number;
+  failed: number;
+  signals_created: number;
+}
+
 export interface ConversationDetail {
   conversation: Conversation;
   messages: Message[];
+  analysis: ConversationAnalysis | null;
 }

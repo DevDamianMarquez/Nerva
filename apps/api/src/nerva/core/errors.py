@@ -77,6 +77,16 @@ class ServiceUnavailableError(NervaError):
     code = "service_unavailable"
 
 
+class RateLimitedError(NervaError):
+    """A required external dependency (an AI provider, say) is rate-limiting
+    us. Distinct from `ServiceUnavailableError`: the caller is expected to
+    succeed by simply trying again shortly, not by waiting for a deployment
+    issue to be fixed."""
+
+    status_code = 429
+    code = "rate_limited"
+
+
 class ImmutableRecordError(RuntimeError):
     """Raised when code attempts to modify or delete an append-only record."""
 
