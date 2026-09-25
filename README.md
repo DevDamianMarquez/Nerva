@@ -9,8 +9,10 @@ one loop:
 > Connect Gmail → analyze conversations → identify leads → propose actions →
 > human approves → Nerva executes → activity and memory are updated.
 
-**This repository is through Milestone 2: real authentication, onboarding, and a
-frontend wired to the API.** There is still no Gmail, no LLM and no agent. See
+**This repository is through Milestone 3: real authentication, onboarding, a frontend
+wired to the API, and read-only Gmail import.** Nerva can observe a connected Gmail
+account (Settings → Integrations → Connect Gmail); it cannot yet send, reply to,
+delete or otherwise act on email, and there is still no LLM or agent. See
 [docs/MVP.md](docs/MVP.md) for exactly what is in and out of scope, and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it is built.
 
@@ -135,6 +137,73 @@ Every request under `/v1/workspaces/{id}/…` requires that the caller is a memb
 workspace; anyone else gets a `404`. See
 [Authentication](docs/ARCHITECTURE.md#authentication) for the full session lifecycle.
 
+## Connect Gmail (optional)
+
+Nerva runs fine without this — Settings → Integrations just shows "Connect Gmail" as
+unavailable until it's configured. To enable it locally:
+
+**1. Create or select a Google Cloud project**
+
+Go to [console.cloud.google.com](https://console.cloud.google.com/), and create a new
+project (or pick an existing one) from the project selector at the top of the page.
+
+**2. Enable the Gmail API**
+
+APIs & Services → Library → search "Gmail API" → Enable.
+
+**3. Configure the OAuth consent screen**
+
+APIs & Services → OAuth consent screen. Choose **External** (unless you have a Google
+Workspace organization and want **Internal**). Fill in an app name and your email as
+the support/developer contact. You do not need to submit this for verification to use
+it in development — see step 7.
+
+**4. Create OAuth Web Application credentials**
+
+APIs & Services → Credentials → Create Credentials → OAuth client ID → Application
+type **Web application**.
+
+**5. Add the authorized redirect URI**
+
+Under that client's "Authorized redirect URIs", add exactly:
+
+```
+http://127.0.0.1:8000/v1/integrations/google/callback
+```
+
+This must match `GOOGLE_REDIRECT_URI` below byte-for-byte, including the port.
+
+**6. Put the client ID, secret, and an encryption key in `.env`**
+
+```bash
+GOOGLE_CLIENT_ID=<the client ID Google gave you>
+GOOGLE_CLIENT_SECRET=<the client secret Google gave you>
+GOOGLE_REDIRECT_URI=http://127.0.0.1:8000/v1/integrations/google/callback
+INTEGRATION_ENCRYPTION_KEY=<generate one, see below>
+```
+
+Generate the encryption key once per checkout (it encrypts stored Gmail refresh
+tokens; never share or commit it):
+
+```bash
+cd apps/api && .venv/Scripts/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+(On macOS/Linux: `.venv/bin/python` instead of `.venv/Scripts/python`.) Restart
+`npm run api:dev` after editing `.env`.
+
+**7. Add yourself as a test user**
+
+While the OAuth consent screen is in **Testing** (the default, and fine for local
+development — publishing it is not necessary), Google only allows sign-in from
+accounts you explicitly list: OAuth consent screen → Audience → **Test users** → add
+the Gmail address you'll connect with. Without this, Google's consent screen refuses
+the login before Nerva ever sees it.
+
+Only `https://www.googleapis.com/auth/gmail.readonly` (plus `openid email` to identify
+the account) is ever requested — Nerva cannot send, delete, or modify anything in a
+connected mailbox. See [ARCHITECTURE.md §10](docs/ARCHITECTURE.md#10-nerva-connect-google-oauth-and-gmail-import).
+
 ## Configuration
 
 The API and Docker Compose are configured through `.env` in the repository root (see
@@ -150,6 +219,10 @@ for local development.
 | `TEST_DATABASE_URL` | same server, database `nerva_test` | Used by the backend tests |
 | `ENVIRONMENT` | `local` | `local`, `test`, or `production` |
 | `CORS_ORIGINS` | `http://127.0.0.1:3000` | Comma-separated browser origins allowed to call the API, with credentials |
+| `FRONTEND_BASE_URL` | `http://127.0.0.1:3000` | Where the API redirects the browser after the Google OAuth callback |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | blank | Google OAuth Web Application credentials; see [Connect Gmail](#connect-gmail-optional) |
+| `GOOGLE_REDIRECT_URI` | `http://127.0.0.1:8000/v1/integrations/google/callback` | Must match the redirect URI configured in Google Cloud exactly |
+| `INTEGRATION_ENCRYPTION_KEY` | blank | Fernet key encrypting stored Gmail refresh tokens; required to connect Gmail |
 | `NEXT_PUBLIC_API_URL` (`apps/web/.env.local`) | `http://127.0.0.1:8000` | Where the browser sends API requests |
 
 ## Troubleshooting
@@ -173,9 +246,15 @@ for local development.
   run `npm run api:revision -- "describe the change"` and review the generated file.
 - **Web build fails while fetching fonts.** The build downloads Geist from Google Fonts
   and needs internet access.
+- **"Google has not verified this app" / "access_denied" when connecting Gmail.** If
+  the OAuth consent screen is still in **Testing**, only accounts added under **Test
+  users** may sign in — see [Connect Gmail, step 7](#connect-gmail-optional).
+- **Connecting Gmail fails immediately with an integration error.** Check that
+  `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and `INTEGRATION_ENCRYPTION_KEY` are all
+  set in `.env` and that the API was restarted after editing it.
 
 ## What is not here yet
 
-Gmail, LLM providers, agents, action execution, embeddings, invitations and
-roles-based permissions are intentionally left for later milestones. See
-[docs/MVP.md](docs/MVP.md).
+Sending, replying to, deleting or modifying email (Gmail access is read-only), LLM
+providers, agents, action execution, embeddings, invitations and roles-based
+permissions are intentionally left for later milestones. See [docs/MVP.md](docs/MVP.md).

@@ -15,6 +15,8 @@ import bcrypt
 
 SESSION_COOKIE_NAME = "nerva_session"
 SESSION_TTL = timedelta(days=30)
+# How long an OAuth `state` value is valid for; see nerva.services.integrations.
+OAUTH_STATE_TTL = timedelta(minutes=10)
 
 
 def hash_password(password: str) -> str:

@@ -61,6 +61,24 @@ class MemoryKind(StrEnum):
     NOTE = "note"
 
 
+class IntegrationProvider(StrEnum):
+    """External account providers Nerva Connect can synchronize. One value today;
+    the table and API are shaped so a second (e.g. Outlook) needs no redesign."""
+
+    GOOGLE = "google"
+
+
+class IntegrationStatus(StrEnum):
+    CONNECTED = "connected"
+    # The refresh token was rejected or revoked; the user must reconnect.
+    NEEDS_REAUTH = "needs_reauth"
+    # The most recent sync attempt failed for a reason other than authorization.
+    ERROR = "error"
+    # Disconnected by the user. The row (and its imported conversations/messages)
+    # is kept, not deleted; see docs/ARCHITECTURE.md.
+    DISCONNECTED = "disconnected"
+
+
 class ActivityEventType(StrEnum):
     WORKSPACE_CREATED = "workspace.created"
     COMPANY_CREATED = "company.created"
@@ -72,3 +90,7 @@ class ActivityEventType(StrEnum):
     ACTION_EXECUTING = "action.executing"
     ACTION_COMPLETED = "action.completed"
     ACTION_FAILED = "action.failed"
+    INTEGRATION_CONNECTED = "integration.connected"
+    INTEGRATION_SYNCED = "integration.synced"
+    INTEGRATION_DISCONNECTED = "integration.disconnected"
+    INTEGRATION_NEEDS_REAUTH = "integration.needs_reauth"

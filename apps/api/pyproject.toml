@@ -16,12 +16,20 @@ dependencies = [
     "alembic>=1.14",
     "psycopg[binary]>=3.2",
     "bcrypt>=4.2",
+    "cryptography>=43",
+    # OAuth token exchange/refresh and Gmail API calls (nerva_connect/google/).
+    "httpx>=0.28",
+    # ID-token verification only (google.oauth2.id_token): not the full API client,
+    # to keep the Google-specific footprint small (see docs/ARCHITECTURE.md).
+    "google-auth>=2.35",
+    # google-auth's own HTTP transport for fetching Google's public certs during
+    # ID-token verification; required by google.auth.transport.requests.
+    "requests>=2.32",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.3",
-    "httpx>=0.28",
     "ruff>=0.8",
     "mypy>=1.13",
 ]
@@ -49,7 +57,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S105", "S106"]
+"tests/**" = ["S105", "S106", "S107"]
 
 [tool.mypy]
 python_version = "3.12"

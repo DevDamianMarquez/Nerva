@@ -17,11 +17,13 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
 import nerva.models  # noqa: F401  (registers tables on Base.metadata)
+from nerva.api.deps import get_gmail_client, get_google_oauth_client
 from nerva.app import create_app
 from nerva.core.config import Settings, get_settings
 from nerva.core.security import SESSION_COOKIE_NAME
 from nerva.db.base import Base
 from nerva.db.session import get_session
+from tests.fakes.google import FakeGmailClient, FakeGoogleOAuthClient
 from tests.helpers import Account, ensure_database
 
 # Satisfies the signup password policy (8-72 characters); not meant to be realistic.
@@ -64,7 +66,24 @@ def db_session(engine: Engine) -> Iterator[Session]:
 
 
 @pytest.fixture
-def client(db_session: Session) -> Iterator[TestClient]:
+def google_oauth_client() -> FakeGoogleOAuthClient:
+    """Stands in for Google's OAuth endpoints. Tweak `.fail_exchange` / `.fail_refresh`
+    / `.identity` in a test to script a specific scenario."""
+    return FakeGoogleOAuthClient()
+
+
+@pytest.fixture
+def gmail_client() -> FakeGmailClient:
+    """A canned mailbox. Populate `.messages` before triggering a sync."""
+    return FakeGmailClient()
+
+
+@pytest.fixture
+def client(
+    db_session: Session,
+    google_oauth_client: FakeGoogleOAuthClient,
+    gmail_client: FakeGmailClient,
+) -> Iterator[TestClient]:
     app = create_app(Settings(environment="test"))
 
     def override_session() -> Iterator[Session]:
@@ -74,6 +93,8 @@ def client(db_session: Session) -> Iterator[TestClient]:
             db_session.rollback()  # like the real dependency: discard anything uncommitted
 
     app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_google_oauth_client] = lambda: google_oauth_client
+    app.dependency_overrides[get_gmail_client] = lambda: gmail_client
     with TestClient(app) as test_client:
         yield test_client
 

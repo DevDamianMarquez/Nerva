@@ -89,3 +89,65 @@ export interface ActivityEvent {
   data: Record<string, unknown>;
   created_at: string;
 }
+
+// --- Nerva Connect: Gmail integration -----------------------------------------------
+
+export type IntegrationProvider = "google";
+export type IntegrationStatus = "connected" | "needs_reauth" | "error" | "disconnected";
+
+export interface Integration {
+  id: string;
+  workspace_id: string;
+  provider: IntegrationProvider;
+  status: IntegrationStatus;
+  external_account_email: string;
+  last_synced_at: string | null;
+  last_error: string | null;
+  created_at: string;
+}
+
+export interface GoogleConnectResponse {
+  authorization_url: string;
+}
+
+export interface SyncResult {
+  threads_seen: number;
+  conversations_created: number;
+  conversations_updated: number;
+  messages_created: number;
+}
+
+// --- Nerva Inbox: conversations and messages ----------------------------------------
+
+export type ConversationChannel = "email";
+
+export interface Conversation {
+  id: string;
+  workspace_id: string;
+  contact_id: string | null;
+  integration_id: string | null;
+  channel: ConversationChannel;
+  subject: string | null;
+  last_message_at: string | null;
+  preview: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type MessageDirection = "inbound" | "outbound";
+
+export interface Message {
+  id: string;
+  conversation_id: string;
+  direction: MessageDirection;
+  sender_email: string;
+  sender_name: string | null;
+  recipients: string;
+  body_text: string;
+  sent_at: string;
+}
+
+export interface ConversationDetail {
+  conversation: Conversation;
+  messages: Message[];
+}

@@ -6,12 +6,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from nerva import __version__
 from nerva.api.router import api_router
 from nerva.core.config import Settings, get_settings
+from nerva.core.crypto import EncryptionNotConfigured, validate_encryption_key
 from nerva.core.errors import register_exception_handlers
 from nerva.routes import health
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
+
+    if settings.environment == "production":
+        try:
+            validate_encryption_key(settings)
+        except EncryptionNotConfigured as exc:
+            raise RuntimeError(
+                "ENVIRONMENT=production requires a valid INTEGRATION_ENCRYPTION_KEY "
+                f"(used to encrypt stored OAuth credentials): {exc}"
+            ) from exc
 
     app = FastAPI(
         title="Nerva API",

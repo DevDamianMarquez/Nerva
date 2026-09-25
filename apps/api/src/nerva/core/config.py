@@ -21,6 +21,18 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://nerva:nerva@127.0.0.1:5433/nerva"
     test_database_url: str = "postgresql+psycopg://nerva:nerva@127.0.0.1:5433/nerva_test"
     cors_origins: str = "http://127.0.0.1:3000"
+    # Where the API redirects the browser after the Google OAuth callback finishes.
+    frontend_base_url: str = "http://127.0.0.1:3000"
+
+    # --- Nerva Connect: Google OAuth / Gmail --------------------------------------
+    # Blank until configured; see README.md for how to create these in Google Cloud.
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = "http://127.0.0.1:8000/v1/integrations/google/callback"
+    # Fernet key (44-char urlsafe-base64) used to encrypt stored OAuth refresh tokens.
+    # Generate one with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    integration_encryption_key: str = ""
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -34,6 +46,10 @@ class Settings(BaseSettings):
         `nerva.core.cookies` for the full reasoning.
         """
         return self.environment == "production"
+
+    @property
+    def google_oauth_configured(self) -> bool:
+        return bool(self.google_client_id and self.google_client_secret)
 
 
 @lru_cache

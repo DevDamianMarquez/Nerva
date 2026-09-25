@@ -10,7 +10,7 @@ from typing import Annotated
 
 from pydantic import EmailStr, Field, StringConstraints, field_validator
 
-from nerva.core.enums import OpportunityStage
+from nerva.core.enums import ConversationChannel, MessageDirection, OpportunityStage
 from nerva.schemas.common import RequestModel, ResponseModel
 
 ShortText = Annotated[str, StringConstraints(min_length=1, max_length=200)]
@@ -81,3 +81,41 @@ class OpportunityRead(ResponseModel):
     currency: str
     created_at: datetime
     updated_at: datetime
+
+
+# --- Conversations and messages (Nerva Inbox) ---------------------------------------
+# Read-only over HTTP: conversations and messages are populated by connectors
+# (nerva.services.integrations), never created directly by a client.
+
+PREVIEW_LENGTH = 160
+
+
+class ConversationRead(ResponseModel):
+    id: uuid.UUID
+    workspace_id: uuid.UUID
+    contact_id: uuid.UUID | None
+    integration_id: uuid.UUID | None
+    channel: ConversationChannel
+    subject: str | None
+    last_message_at: datetime | None
+    # A short excerpt of the latest message's plain-text body, for the conversation
+    # list. Computed at read time, not stored.
+    preview: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class MessageRead(ResponseModel):
+    id: uuid.UUID
+    conversation_id: uuid.UUID
+    direction: MessageDirection
+    sender_email: str
+    sender_name: str | None
+    recipients: str
+    body_text: str
+    sent_at: datetime
+
+
+class ConversationDetailRead(ResponseModel):
+    conversation: ConversationRead
+    messages: list[MessageRead]

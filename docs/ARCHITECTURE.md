@@ -73,10 +73,10 @@ Notable choices:
 ```
 users ──< workspace_members >── workspaces
                                     │ (every table below carries workspace_id)
-        ┌───────────────┬───────────┼───────────────┬───────────────┐
-    companies ──< contacts    conversations ──< messages     activity_events
-        │            │              │
-        └──────┬─────┴──────────────┘
+        ┌───────────────┬───────────┼───────────────┬───────────────┬─────────────┐
+    companies ──< contacts    conversations ──< messages     activity_events   integrations
+        │            │              │                                             │
+        └──────┬─────┴──────────────┴─────────────────────────────────────────────┘
           opportunities ──< actions
    memories ── (workspace, or one contact / company / opportunity)
 ```
@@ -85,12 +85,14 @@ users ──< workspace_members >── workspaces
 | --- | --- |
 | `users` | A person. Exists above the tenant boundary. Email is unique and lower-case; `password_hash` is a bcrypt hash, never returned by the API. |
 | `sessions` | A logged-in browser session: `user_id`, a SHA-256 `token_hash` (the raw token lives only in the cookie), `expires_at`, `revoked_at`. Above the tenant boundary, like `users`. |
+| `oauth_states` | A short-lived, single-use, server-bound value for one in-progress OAuth connect attempt. Above the tenant boundary. See [§10](#10-nerva-connect-google-oauth-and-gmail-import). |
 | `workspaces` | A tenant (a company using Nerva). `slug` is unique. |
 | `workspace_members` | `(workspace_id, user_id, role)`. **The authorization source of truth.** Roles: owner, admin, member. |
 | `companies` | An organization the workspace deals with. |
 | `contacts` | A person, unique by email **within a workspace**; optionally belongs to a company. |
-| `conversations` | A thread with a contact, with a `channel` and an `external_id` (e.g. a Gmail thread id). Filled by connectors later. |
-| `messages` | A message within a conversation (direction, sender, body, sent time). |
+| `integrations` | A connected external account (Gmail today). Provider, status, the connected account's stable id and email, and an *encrypted* refresh token. See [§10](#10-nerva-connect-google-oauth-and-gmail-import). |
+| `conversations` | A thread with a contact, with a `channel`, an `external_id` (e.g. a Gmail thread id) and the `integration` that imported it, if any. |
+| `messages` | A message within a conversation (direction, sender, recipients, body, sent time), unique per workspace by its provider `external_id` — see idempotency, [§10](#10-nerva-connect-google-oauth-and-gmail-import). |
 | `opportunities` | A lead/deal: title, stage (new → qualified → proposal → won/lost), optional value; may link a contact, company and the conversation it came from. |
 | `actions` | Something Nerva proposes to do, gated by approval. See §5. |
 | `activity_events` | The append-only audit trail. See §6. |
@@ -266,7 +268,7 @@ each will be designed when its first real implementation arrives.
 | **`nerva_core`** | The agent runtime: reads workspace context and memory, decides what to propose, coordinates work. Produces `Action` proposals via the same `ActionService` as humans, attributed to `Actor.nerva()`. | Lead identification from conversations |
 | **`nerva_actions`** | Executors that carry out approved actions, per-type payload schemas, retry policy. Uses `start_execution` / `complete` / `fail`. | Send an approved email reply |
 | **`nerva_memory`** | Writing, ranking and recalling workspace memory. Starts relational; embeddings/pgvector only if retrieval quality demands it. | Persist facts learned from conversations |
-| **`nerva_connect`** | Connectors to external tools (Gmail first): OAuth, sync into `Conversation`/`Message`, and the API calls that executors need. | Read-only Gmail import |
+| **`nerva_connect`** | Connectors to external tools. Gmail (read-only import) is real as of Milestone 3 — see [§10](#10-nerva-connect-google-oauth-and-gmail-import). | Send an approved email reply (needs write access, not part of Milestone 3) |
 
 The rules that keep these honest: everything Nerva does is a proposed `Action` gated by
 approval; everything is scoped to a workspace through `WorkspaceContext`; everything
@@ -326,3 +328,210 @@ important leaves an `ActivityEvent`.
   `fetch`: it always sends `credentials: "include"`, and turns the API's
   `{"error": {"code","message","details"}}` body into a typed `ApiError` (`status`,
   `code`, `message`, `details`) that callers branch on (e.g. `error.status === 401`).
+
+## 10. Nerva Connect: Google OAuth and Gmail import
+
+**Scope for this milestone: read-only.** Nerva can observe Gmail (import conversations
+and messages) but cannot send, reply, delete, archive, label or mark anything in the
+connected mailbox. The only Gmail permission ever requested is
+`https://www.googleapis.com/auth/gmail.readonly`, plus `openid email` to identify the
+connected account. Write access is a later, separate milestone with its own consent and
+review.
+
+### The connector boundary
+
+```
+nerva_connect/
+  google/
+    oauth.py     GoogleOAuthClient: authorization URL, code exchange, refresh, revoke,
+                 ID-token verification. Talks to Google's OAuth endpoints over HTTPS
+                 (httpx) and uses google-auth only for verifying the ID token's
+                 signature — not something to hand-roll.
+    gmail.py     GmailClient: users.messages.list / .get against the official Gmail
+                 REST API. No other endpoints are called; nothing here can mutate a
+                 mailbox.
+    mapper.py    Pure functions: raw Gmail message -> NormalizedMessage. Also where
+                 HTML bodies are converted to safe plain text (see below).
+    errors.py    GoogleAuthError (bad/revoked grant) vs GoogleApiError (anything
+                 else) — the distinction a sync needs to choose `needs_reauth` vs
+                 `error`.
+```
+
+Everything here is Google-specific and knows nothing about workspaces, sessions or the
+database. Orchestration — authorize, call the connector, write `Conversation` /
+`Message` / `Integration` rows, record activity — lives in
+`nerva.services.integrations` (`IntegrationService`, `GmailSyncService`,
+`complete_google_connect`), which is where a second connector (e.g. Outlook) would plug
+in without changing anything downstream: the rest of Nerva only ever sees normalized
+`Conversation` / `Message` rows, never a provider's response shape.
+
+Both Google clients are FastAPI dependencies (`get_google_oauth_client`,
+`get_gmail_client` in `nerva.api.deps`), so tests substitute fakes
+(`apps/api/tests/fakes/google.py`) via `app.dependency_overrides` — no test ever makes a
+real network call or needs a real Google account.
+
+### OAuth flow and state
+
+1. `POST /v1/workspaces/{id}/integrations/google/connect` (owner-only, authenticated):
+   generates a random 32-byte `state` token, stores only its SHA-256 hash in
+   `oauth_states` bound to the calling `user_id` and `workspace_id` (10-minute expiry),
+   and returns Google's consent URL with that state attached. The frontend navigates
+   the browser there (`window.location.href = ...`) — this is not a `fetch`, so
+   Google's own page can render.
+2. The user consents (or not) on Google's own page. Google redirects the browser to
+   `GET /v1/integrations/google/callback?code=...&state=...` — a route with **no**
+   `workspace_id` in its path, because Google does not know about workspaces.
+3. The callback (`complete_google_connect`) validates the state: looks it up by hash,
+   requires it to be unexpired and not already consumed (marking it consumed
+   atomically, so a replayed callback fails), and requires the *currently
+   authenticated* user (from the session cookie, not any value Google or the browser
+   supplied) to match the state's `user_id`. Only then is the state's `workspace_id`
+   trusted — and even then, membership is re-verified through the real authorization
+   gate (`WorkspaceService.get_context`), never assumed. This is what stops OAuth CSRF,
+   callback replay, and connecting an integration to a workspace the caller does not
+   belong to.
+4. On success, the code is exchanged for tokens, the ID token is verified (Google's
+   public keys, via `google-auth`) to get the account's stable `sub` and `email`, and
+   the `Integration` row is created or — if that Google account was already connected
+   to this workspace — updated in place (see below). One `ActivityEvent` is recorded.
+5. The callback always **redirects the browser** to `{FRONTEND_BASE_URL}/settings`,
+   with `?integration=connected` or `?integration=error&reason=...` — never a raw JSON
+   error, since this response lands mid-navigation, not in a `fetch` handler. The
+   Settings page reads that query string once, shows a banner, and strips it
+   (`router.replace("/settings")`).
+
+**Duplicate accounts**: `integrations` has `UNIQUE(workspace_id, provider,
+external_account_id)`, keyed on the Google `sub` claim — not the email, which can
+change (aliases, renames) and must never be treated as a stable identity. Reconnecting
+the same account updates the existing row's status and encrypted refresh token instead
+of creating a duplicate.
+
+**Owner-only management**: connecting, syncing and disconnecting an integration require
+`WorkspaceContext.role == owner` (`_require_owner` in `nerva.services.integrations`).
+Any member may list integrations and read what has synced. This is narrower than the
+rest of the app (where membership alone is currently enough for most actions) because
+granting a third-party account access to a mailbox is more sensitive than approving a
+proposed action — a deliberate MVP tightening, not a general role system (that is still
+future work; see §4's authentication notes).
+
+### Credential storage and encryption
+
+Only a **refresh token** is stored — never an access token. Access tokens are
+short-lived (~1 hour) and cheap to mint on demand from the refresh token, so persisting
+one would add attack surface for no benefit; every sync fetches a fresh access token
+and discards it when the request finishes.
+
+The refresh token is encrypted with **Fernet** (AES-128-CBC + HMAC-SHA256, from the
+`cryptography` package — a standard, well-reviewed authenticated-encryption
+construction, not a custom one) under a single symmetric key,
+`INTEGRATION_ENCRYPTION_KEY` (`nerva.core.crypto`). Authenticated encryption matters
+here specifically: a tampered ciphertext fails to decrypt loudly (`EncryptionNotConfigured`)
+rather than silently returning garbage that might otherwise be sent to Google as a
+"refresh token."
+
+- **Production startup fails clearly** if the key is missing or not a valid Fernet key
+  (`create_app` calls `validate_encryption_key` when `ENVIRONMENT=production`) — the
+  same pattern the old dev-auth gate used, now guarding a real secret instead.
+- **Never returned or logged**: `IntegrationRead` has no token field at all (not even
+  encrypted), the client secret lives only in `Settings` and is never serialized, and
+  nothing in the sync path logs a token or a raw Google response.
+- **Key rotation** is a documented future concern, not implemented: rotating the key
+  means decrypting every stored `encrypted_refresh_token` with the old key and
+  re-encrypting with the new one in one migration step. Because only a small number of
+  refresh tokens exist per workspace (one per connected account) rather than, say, every
+  session, this is cheap whenever it is needed.
+
+### Synchronization
+
+`POST /v1/workspaces/{id}/integrations/{integration_id}/sync` (owner-only,
+user-triggered — no background worker in this milestone) runs `GmailSyncService.sync`:
+
+1. Refresh the access token from the stored (decrypted) refresh token. If Google
+   rejects it (`GoogleAuthError` — revoked, expired grant), the integration is marked
+   `needs_reauth`, an `ActivityEvent` is recorded, and the endpoint returns `409` with
+   `{"code": "needs_reauth"}` — **the sync never claims success it did not achieve.**
+   Any other failure (`GoogleApiError` — network, rate limit, unexpected response)
+   marks the integration `error` and returns `409` with `{"code": "sync_failed"}`,
+   equally honestly.
+2. List recent message ids, bounded on **two axes** so a very active mailbox is never
+   accidentally downloaded in full:
+   - **Time window**: only messages received in the last **30 days**
+     (`SYNC_WINDOW_DAYS`, via Gmail's `q=after:...` search).
+   - **Hard cap**: at most **200 messages** per sync run (`MAX_MESSAGES_PER_SYNC`),
+     regardless of how many fall in the window.
+3. For each message id **not already imported** (see idempotency below), fetch the full
+   message, normalize it (`mapper.parse_gmail_message`), and upsert its `Conversation`
+   (by Gmail thread id) and insert its `Message`.
+4. Update `last_synced_at` and `status = connected`, and record **one**
+   `ActivityEvent` for the whole run (`integration.synced`, with counts) — not one per
+   message or per conversation, so the audit trail stays a readable log of what
+   happened rather than noise proportional to mailbox size.
+
+**Idempotency**: `messages.external_id` is unique per workspace
+(`UNIQUE(workspace_id, external_id)`). Before importing a message, the sync checks
+whether that id is already present and skips it if so. Running sync twice (or syncing
+after a partial previous failure) creates zero duplicate conversations or messages —
+it only imports what is new. `conversations` was already unique per
+`(workspace_id, channel, external_id)` (the Gmail thread id), from before this
+milestone, so a thread with new messages is *updated*, never duplicated, on repeat
+syncs.
+
+### Mapping Gmail into Conversation / Message
+
+- **Participants**: for each message, the non-account-owner party (sender for an
+  inbound message, first non-self recipient for an outbound one) is resolved to a
+  `Contact` — found by email, or created if new. The conversation's `contact_id` is
+  set from the first message that establishes one.
+- **Body extraction** (`mapper.extract_plain_text`) prefers a `text/plain` MIME part,
+  recursing into `multipart/*` messages to find one. If only `text/html` exists, it is
+  converted to plain text (below) rather than stored as HTML. If neither is present,
+  Gmail's own `snippet` is used as a last resort.
+- **Recipients** (`To` + `Cc`) are stored as a simple comma-separated display string,
+  not a normalized join table — enough to show "To: …" without a relational model this
+  MVP does not need yet.
+- **Attachments** are not downloaded or persisted in any form in this milestone.
+
+### Email content is untrusted input
+
+Even though no LLM reads this content yet, email bodies are treated as untrusted
+external content from the moment they are imported, because that boundary is much
+easier to get right once (at ingestion) than to retrofit later:
+
+- **HTML is never executed or rendered.** `mapper.html_to_text` uses Python's standard
+  `html.parser.HTMLParser` purely as a tokenizer — it extracts text nodes and
+  explicitly discards the contents of `<script>` and `<style>` tags, never evaluates
+  anything. What reaches the database is plain text.
+- **The frontend renders `body_text` as a plain React string** (`{message.body_text}`),
+  which JSX escapes like any other text — there is no `dangerouslySetInnerHTML` and no
+  path from a stored message to raw HTML in the browser.
+- **Raw provider payloads never reach the API surface.** `ConversationRead` /
+  `MessageRead` expose only the normalized fields; nothing returns Gmail's original
+  JSON.
+- **Sender/recipient addresses are never authorization data.** They identify a
+  `Contact` for display and CRM linking only; nothing about who a message claims to be
+  from grants any permission.
+- **Message bodies are not written to application logs.**
+- **Looking ahead**: when an LLM milestone reads this data, `body_text` (and anything
+  derived from it) must be treated the same way a web page's content would be —
+  untrusted model input, not instructions — exactly the same principle this codebase
+  already applies to tool results elsewhere. Converting HTML to plain text now, instead
+  of only "when the LLM needs it," means that boundary is already crossed once, in one
+  place, and does not need to be rediscovered later.
+
+### Settings and Inbox
+
+- **Settings → Integrations** replaces the placeholder with a real Gmail card: three
+  states (not connected → "Connect Gmail"; connected → account email, last synced,
+  "Sync now" / "Disconnect"; needs reauth → "Reconnect Gmail"), plus an error state for
+  a failed sync. A banner (from the callback's redirect query string) confirms success
+  or explains failure in plain language, never Google's raw error code.
+- **Inbox** replaces the static placeholder with a two-pane conversation list/detail
+  view, backed by `GET /v1/workspaces/{id}/conversations` and `.../conversations/{id}`.
+  It distinguishes "no Gmail connected yet" (links to Settings) from "connected but
+  nothing synced yet" (also links to Settings, to run a sync) from a populated list.
+  There is no reply box or compose affordance anywhere — the UI does not suggest Nerva
+  can act on email yet, matching the read-only scope above.
+- **Disconnecting** revokes the credential with Google (best-effort) and marks the
+  integration `disconnected`, but **keeps** the `Integration` row and every imported
+  `Conversation` / `Message` — disconnecting removes access, not history. Reconnecting
+  the same account later updates that same row.

@@ -10,10 +10,10 @@ from collections.abc import Sequence
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from nerva.core.enums import MemberRole
-from nerva.core.security import SESSION_TTL
+from nerva.core.enums import IntegrationProvider, MemberRole
+from nerva.core.security import OAUTH_STATE_TTL, SESSION_TTL
 from nerva.db.base import utcnow
-from nerva.models import User, UserSession, Workspace, WorkspaceMember
+from nerva.models import OAuthState, User, UserSession, Workspace, WorkspaceMember
 
 
 class UserRepository:
@@ -121,3 +121,45 @@ class SessionRepository:
         if record is not None:
             record.revoked_at = utcnow()
             self.session.flush()
+
+
+class OAuthStateRepository:
+    """The CSRF/replay guard for the OAuth connect flow. `consume` is the only way to
+    read a state back, and it can succeed at most once per value."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def add(
+        self,
+        *,
+        state_hash: str,
+        provider: IntegrationProvider,
+        workspace_id: uuid.UUID,
+        user_id: uuid.UUID,
+    ) -> OAuthState:
+        record = OAuthState(
+            state_hash=state_hash,
+            provider=provider,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            expires_at=utcnow() + OAUTH_STATE_TTL,
+        )
+        self.session.add(record)
+        self.session.flush()
+        return record
+
+    def consume(self, state_hash: str) -> OAuthState | None:
+        """Returns the matching state and marks it used, or `None` if it does not
+        exist, has expired, or was already consumed (replay)."""
+        record = self.session.scalars(
+            select(OAuthState).where(
+                OAuthState.state_hash == state_hash,
+                OAuthState.consumed_at.is_(None),
+                OAuthState.expires_at > utcnow(),
+            )
+        ).one_or_none()
+        if record is not None:
+            record.consumed_at = utcnow()
+            self.session.flush()
+        return record

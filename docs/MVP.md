@@ -75,19 +75,47 @@ workspace, and see your own data.
   reason it was blocked (the spoofable dev header) no longer exists — though it is
   still not deployed anywhere.
 
-## What v0.1 (+ Milestone 2) intentionally excludes
+## Milestone 3: Nerva Connect — Google OAuth + Gmail ingestion
+
+Nerva can now **observe** Gmail. It cannot yet understand, classify, reply to, modify,
+archive, delete or send email — that boundary is deliberate and enforced by the OAuth
+scope requested (`gmail.readonly` only).
+
+- **Google OAuth 2.0**: an authenticated workspace owner connects a Google account from
+  Settings → Integrations. A cryptographically secure, single-use, server-bound `state`
+  value protects the flow against OAuth CSRF, callback replay, and connecting an
+  integration to a workspace the caller does not belong to.
+- **Encrypted credential storage**: only a refresh token is ever stored, encrypted at
+  rest (Fernet); no access token is persisted, and no schema returns a token to the
+  frontend.
+- **A bounded, idempotent sync**: `POST .../integrations/{id}/sync` imports at most the
+  last 30 days of mail, capped at 200 messages per run, and running it twice never
+  duplicates a conversation or message.
+- **Normalized data**: Gmail threads and messages become `Conversation` / `Message`
+  rows — the same tables a future connector (e.g. Outlook) would also fill — with HTML
+  bodies converted to safe plain text, never rendered as HTML.
+- **Nerva Inbox** shows the result: a real conversation list and detail view, replacing
+  the placeholder.
+
+See [ARCHITECTURE.md §10](ARCHITECTURE.md#10-nerva-connect-google-oauth-and-gmail-import)
+for the full design, including the security decisions (state handling, token
+encryption, content-safety treatment of email) and what is deliberately deferred (write
+access, background/scheduled sync, key rotation tooling).
+
+## What v0.1 (+ Milestones 2–3) intentionally excludes
 
 | Excluded | Why it waits |
 | --- | --- |
-| Gmail (OAuth, sync, sending) | Needs a settled data model and auth, both now in place; first feature of the next milestone. |
-| LLM providers and prompts | The chat UI is visual only; nothing typed in it leaves the browser. |
-| Autonomous agents, planning, tool use | Requires connectors and an executor to be meaningful. |
+| Sending, replying to, deleting, archiving or labeling email | Gmail access is deliberately read-only in this milestone; a write-access milestone needs its own consent scope and review. |
+| LLM providers and prompts | The chat UI is visual only; nothing typed in it leaves the browser. Imported email is already treated as untrusted input for when this lands (see ARCHITECTURE.md §10). |
+| Autonomous agents, planning, tool use | Requires an executor to be meaningful, not just a connector. |
 | Action **execution** | Only the lifecycle exists. Nothing is ever sent, created or changed outside Nerva. |
+| Lead/opportunity detection from email | Nerva imports conversations; it does not yet read them. |
 | Vector database, embeddings, pgvector | Memory is a plain relational table. |
-| Invitations, roles-based permissions | Roles are stored; only membership is enforced. Members are created by owning a workspace, via onboarding. |
+| Invitations, roles-based permissions | Roles are stored; only membership (and, for integrations, ownership) is enforced. Members are created by owning a workspace, via onboarding. |
 | Password reset, email verification | The session/token design does not make either hard to add later (see ARCHITECTURE.md). |
 | Multi-workspace switching | A user's first workspace is used; the frontend state already separates "all workspaces" from "current one" for when this is added. |
-| Background jobs and queues | No workloads that need them yet. |
+| Background jobs and queues | Sync is user-triggered; no scheduler exists yet. |
 | Billing, SSO, notifications, mobile app | Not part of proving the loop. |
 | Production deployment, CI/CD | The API supports `ENVIRONMENT=production`; nothing is actually deployed. |
 
@@ -115,11 +143,33 @@ If a change needs something from this list, it is a **new milestone**, not part 
 - [x] Tenant isolation (§4 of ARCHITECTURE.md) holds under the new auth system.
 - [x] Backend tests, frontend tests, lint, type checking and builds all pass.
 
+## Definition of done for Milestone 3
+
+- [x] Google OAuth state is unpredictable, single-use, and bound server-side to the
+      user/workspace that started the connection; CSRF, replay and cross-workspace
+      connection attempts are all rejected and covered by tests.
+- [x] Gmail refresh tokens are encrypted at rest; no API response ever includes a
+      token; production refuses to start without a valid encryption key.
+- [x] Sync is bounded (30 days / 200 messages) and idempotent (verified by tests that
+      run it twice); a provider failure marks the integration `error` or
+      `needs_reauth` and never reports success it did not achieve.
+- [x] Settings → Integrations and Inbox show real Gmail state (disconnected /
+      connected / needs reauth) and real synchronized conversations, with correct
+      empty states.
+- [x] Tenant isolation extends to integrations and imported conversations/messages: a
+      workspace can never see another's.
+- [x] Backend tests, frontend tests, lint, type checking, mypy strict and builds all
+      pass, entirely against fakes — no automated test needs a real Google account.
+- [x] **A real Gmail account has been connected and synced end to end in the browser.**
+      Verified live against a real Google Cloud OAuth client and a real Gmail mailbox:
+      the full consent flow, an initial sync (192 messages into 188 conversations), a
+      second sync proving idempotency (0 new records created), Inbox and persistence
+      across a page refresh, and clean backend/browser logs throughout.
+
 ## What comes next (not started)
 
 1. **Workspace invitations** and enforced, role-based permissions.
-2. **Connect Gmail** (read-only first): import conversations into `Conversation` / `Message`.
-3. **Analysis**: identify leads and opportunities from conversations.
-4. **Propose**: Nerva creates `Action`s (e.g. a drafted reply) for human approval.
-5. **Execute**: run approved actions through Gmail; record results and activity.
-6. **Memory**: write and recall workspace memory from what Nerva learns.
+2. **Analysis**: identify leads and opportunities from conversations Nerva has imported.
+3. **Propose**: Nerva creates `Action`s (e.g. a drafted reply) for human approval.
+4. **Execute**: run approved actions through Gmail (write access); record results and activity.
+5. **Memory**: write and recall workspace memory from what Nerva learns.

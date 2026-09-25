@@ -31,6 +31,19 @@ class AuthenticationError(NervaError):
     code = "unauthenticated"
 
 
+class AuthorizationError(NervaError):
+    """The caller is authenticated and a workspace member, but lacks permission for
+    this specific operation (e.g. a non-owner managing an integration).
+
+    Unlike `NotFoundError`, this is used only where the caller already knows the
+    resource exists — it must never be used in place of `NotFoundError` for
+    cross-tenant access, which stays a 404 so tenants cannot be enumerated.
+    """
+
+    status_code = 403
+    code = "forbidden"
+
+
 class NotFoundError(NervaError):
     """Also used for resources in a workspace the caller does not belong to,
     so that the existence of other tenants' data is never revealed."""
@@ -53,6 +66,15 @@ class InvalidReferenceError(NervaError):
 
     status_code = 422
     code = "invalid_reference"
+
+
+class ServiceUnavailableError(NervaError):
+    """A required external dependency is not configured or could not be reached
+    (e.g. Google OAuth credentials are not set). Distinct from a 500: the request
+    itself was fine, but this deployment cannot fulfill it right now."""
+
+    status_code = 503
+    code = "service_unavailable"
 
 
 class ImmutableRecordError(RuntimeError):

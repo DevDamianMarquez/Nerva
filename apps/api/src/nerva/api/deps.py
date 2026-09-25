@@ -13,6 +13,8 @@ from nerva.core.errors import AuthenticationError
 from nerva.core.security import SESSION_COOKIE_NAME
 from nerva.db.session import get_session
 from nerva.models import User
+from nerva.nerva_connect.google.gmail import GmailClient
+from nerva.nerva_connect.google.oauth import GoogleOAuthClient
 from nerva.services.auth import AuthService
 from nerva.services.identity import WorkspaceService
 
@@ -53,6 +55,20 @@ def get_workspace_context(
 
 
 WorkspaceCtx = Annotated[WorkspaceContext, Depends(get_workspace_context)]
+
+
+def get_google_oauth_client(settings: SettingsDep) -> GoogleOAuthClient:
+    return GoogleOAuthClient(settings)
+
+
+GoogleOAuthDep = Annotated[GoogleOAuthClient, Depends(get_google_oauth_client)]
+
+
+def get_gmail_client() -> GmailClient:
+    return GmailClient()
+
+
+GmailClientDep = Annotated[GmailClient, Depends(get_gmail_client)]
 
 
 @dataclass
