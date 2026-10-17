@@ -50,6 +50,7 @@ const connectedIntegration: Integration = {
   last_synced_at: "2024-01-01T00:00:00Z",
   last_error: null,
   created_at: "2024-01-01T00:00:00Z",
+  can_send: true,
 };
 
 const conversation: Conversation = {

@@ -219,6 +219,56 @@ def complete_google_connect(
     return ConnectCallbackResult(True, workspace_id=ctx.workspace_id)
 
 
+class GoogleCredentialRefresher:
+    """Mints a short-lived Gmail access token from a workspace's stored, encrypted
+    refresh token — the one place that happens. Shared by `GmailSyncService`
+    (mailbox import) and `nerva.nerva_connect.google.send_executor.GmailSendExecutor`
+    (Gmail send, Milestone 5 Block 5), so a second caller of the Gmail API never
+    re-implements decrypt/refresh/re-encrypt or duplicates the `needs_reauth` vs
+    `error` classification below — see docs/ARCHITECTURE.md §5.5.
+    """
+
+    def __init__(
+        self, session: Session, ctx: WorkspaceContext, *, oauth_client: GoogleOAuthClient
+    ) -> None:
+        self.session = session
+        self.oauth_client = oauth_client
+        self.activity = ActivityService(session, ctx.workspace_id)
+
+    def refresh_access_token(self, integration: Integration) -> str:
+        """Raises `IntegrationAuthError` if Google rejected the stored grant (the
+        integration is marked `needs_reauth` first, committed immediately) or
+        `IntegrationSyncError` for any other failure (marked `error`, likewise
+        committed) — exactly the same split every caller already handles from
+        `GmailSyncService.sync`."""
+        if not integration.encrypted_refresh_token:
+            raise IntegrationAuthError("Integration has no stored refresh token.")
+        refresh_token = decrypt_secret(integration.encrypted_refresh_token)
+        try:
+            tokens = self.oauth_client.refresh(refresh_token)
+        except GoogleAuthError as exc:
+            integration.status = IntegrationStatus.NEEDS_REAUTH
+            integration.last_error = "Google rejected the stored credentials."
+            self.activity.record(
+                actor=Actor.nerva(),
+                event_type=ActivityEventType.INTEGRATION_NEEDS_REAUTH,
+                entity_type="integration",
+                entity_id=integration.id,
+                summary=f"Gmail ({integration.external_account_email}) needs to be reconnected.",
+            )
+            self.session.commit()
+            raise IntegrationAuthError(str(exc)) from exc
+        except GoogleApiError as exc:
+            integration.status = IntegrationStatus.ERROR
+            integration.last_error = "Could not reach Google to refresh access."
+            self.session.commit()
+            raise IntegrationSyncError(str(exc)) from exc
+
+        if tokens.refresh_token:  # Google does not always issue a new one
+            integration.encrypted_refresh_token = encrypt_secret(tokens.refresh_token)
+        return tokens.access_token
+
+
 class GmailSyncService:
     def __init__(
         self,
@@ -230,13 +280,13 @@ class GmailSyncService:
     ) -> None:
         self.session = session
         self.ctx = ctx
-        self.oauth_client = oauth_client
         self.gmail_client = gmail_client
         self.integrations = IntegrationRepository(session, ctx.workspace_id)
         self.conversations = ConversationRepository(session, ctx.workspace_id)
         self.messages = MessageRepository(session, ctx.workspace_id)
         self.contacts = ContactRepository(session, ctx.workspace_id)
         self.activity = ActivityService(session, ctx.workspace_id)
+        self.credentials = GoogleCredentialRefresher(session, ctx, oauth_client=oauth_client)
 
     def sync(self, integration_id: uuid.UUID) -> SyncResult:
         _require_owner(self.ctx)
@@ -247,7 +297,7 @@ class GmailSyncService:
         if disconnected or not integration.encrypted_refresh_token:
             raise ConflictError("This integration is disconnected; reconnect it first.")
 
-        access_token = self._refresh_access_token(integration)
+        access_token = self.credentials.refresh_access_token(integration)
         message_ids = self._list_recent_message_ids(integration, access_token)
 
         conversations_created = 0
@@ -305,33 +355,6 @@ class GmailSyncService:
             conversations_updated=conversations_updated,
             messages_created=messages_created,
         )
-
-    def _refresh_access_token(self, integration: Integration) -> str:
-        assert integration.encrypted_refresh_token is not None  # checked by caller
-        refresh_token = decrypt_secret(integration.encrypted_refresh_token)
-        try:
-            tokens = self.oauth_client.refresh(refresh_token)
-        except GoogleAuthError as exc:
-            integration.status = IntegrationStatus.NEEDS_REAUTH
-            integration.last_error = "Google rejected the stored credentials."
-            self.activity.record(
-                actor=Actor.nerva(),
-                event_type=ActivityEventType.INTEGRATION_NEEDS_REAUTH,
-                entity_type="integration",
-                entity_id=integration.id,
-                summary=f"Gmail ({integration.external_account_email}) needs to be reconnected.",
-            )
-            self.session.commit()
-            raise IntegrationAuthError(str(exc)) from exc
-        except GoogleApiError as exc:
-            integration.status = IntegrationStatus.ERROR
-            integration.last_error = "Could not reach Google to refresh access."
-            self.session.commit()
-            raise IntegrationSyncError(str(exc)) from exc
-
-        if tokens.refresh_token:  # Google does not always issue a new one
-            integration.encrypted_refresh_token = encrypt_secret(tokens.refresh_token)
-        return tokens.access_token
 
     def _list_recent_message_ids(self, integration: Integration, access_token: str) -> list[str]:
         after = date.today() - timedelta(days=SYNC_WINDOW_DAYS)

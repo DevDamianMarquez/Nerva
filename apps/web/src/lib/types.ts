@@ -104,6 +104,11 @@ export interface Integration {
   last_synced_at: string | null;
   last_error: string | null;
   created_at: string;
+  /** Whether the stored OAuth grant includes `gmail.send`, not just read access.
+   * An integration connected before this field existed, or under an older scope
+   * list, can be `status: "connected"` with `can_send: false` — it needs to be
+   * reconnected before Nerva can send through it. */
+  can_send: boolean;
 }
 
 export interface GoogleConnectResponse {

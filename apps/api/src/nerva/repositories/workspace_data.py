@@ -13,6 +13,9 @@ from nerva.core.enums import (
     ConversationChannel,
     ConversationPriority,
     IntegrationProvider,
+    MemoryKind,
+    MemoryOrigin,
+    MemoryStatus,
     OpportunityStage,
 )
 from nerva.models import (
@@ -24,6 +27,7 @@ from nerva.models import (
     Conversation,
     ConversationAnalysis,
     Integration,
+    Memory,
     Message,
     Opportunity,
 )
@@ -173,10 +177,28 @@ class ConversationAnalysisRepository(ScopedRepository[ConversationAnalysis]):
         """The current analysis for a conversation, if one exists — there is at
         most one per conversation (see the model's docstring). `for_update` locks
         the row so a future `AnalysisService` can check-then-write without racing
-        a concurrent analysis attempt for the same conversation."""
+        a concurrent analysis attempt for the same conversation.
+
+        `for_update` also forces `populate_existing`: `with_for_update()` alone
+        guarantees the *database* blocks on, then returns, the row's current
+        committed values — it says nothing about what the *ORM* hands back. If
+        this session already holds a (non-expired) `ConversationAnalysis` for
+        this id — e.g. it mutated and committed this very row earlier in its own
+        lifetime — SQLAlchemy's identity map returns that cached Python object
+        as-is rather than repopulating it from the fresh row data, regardless of
+        what the lock just waited on. Both the production session factory
+        (`db.session.make_session_factory`) and the test fixture (`tests.
+        conftest.db_session`) set `expire_on_commit=False`, so nothing else ever
+        forces that repopulation on its own. `populate_existing` is the
+        documented way to force it: only a locking read needs this (a caller
+        deciding something based on "the current row" must not silently act on
+        a stale in-memory copy); a plain, non-locking read is unaffected."""
         statement = self._select().where(ConversationAnalysis.conversation_id == conversation_id)
         if for_update:
-            statement = statement.with_for_update()
+            # `populate_existing()` is a `Query`-only method; `Select` (2.0-style,
+            # used throughout this module) takes the same effect as an execution
+            # option instead.
+            statement = statement.with_for_update().execution_options(populate_existing=True)
         return self.session.scalars(statement).one_or_none()
 
 
@@ -224,6 +246,114 @@ class BusinessSignalRepository(ScopedRepository[BusinessSignal]):
         return self._page(statement, limit=limit, offset=offset)
 
 
+class MemoryRepository(ScopedRepository[Memory]):
+    model = Memory
+
+    def get_for_update(self, memory_id: uuid.UUID) -> Memory | None:
+        """Row-locking read used for status transitions, mirroring
+        `ActionRepository.get_for_update`."""
+        return self.session.scalars(
+            self._select().where(Memory.id == memory_id).with_for_update()
+        ).one_or_none()
+
+    def get_active_for_analysis(
+        self, source_analysis_id: uuid.UUID, *, kind: MemoryKind
+    ) -> Sequence[Memory]:
+        """Every currently-active memory of `kind` sourced from this analysis,
+        strictly isolated to this repository's workspace (via `_select`) —
+        the read `nerva_core.memory_rules.decide_memory_formation` is built
+        from (see that module's docstring for why `kind=FACT` plus this
+        analysis id is enough to mean "the estimated_value memory" in M6.3,
+        and why that would stop being true for a second automated fact).
+
+        `source_analysis_id` is `ConversationAnalysis.id` — stable across
+        re-analyses of the same conversation, since that row is overwritten in
+        place rather than appended (see `nerva.models.analysis`'s module
+        docstring). It therefore identifies "memories derived from analyzing
+        this conversation", not a specific analysis *run*'s content; that
+        finer-grained identity is `Memory.source_fingerprint`, which a caller
+        compares separately (idempotency against retries is a decision, not a
+        query filter — see `nerva_core.memory_rules`).
+
+        Returns a `Sequence`, not a single optional row: nothing in the schema
+        enforces at most one active memory per `(source_analysis_id, kind)` —
+        there is no unique constraint on `source_analysis_id` (see
+        `nerva.models.memory`) — so a caller must not assume uniqueness the
+        database does not. Upholding "at most one active estimated_value
+        memory per source" is this rule layer's job going forward, not a
+        guarantee this method can make by construction.
+        """
+        return self.session.scalars(
+            self._select().where(
+                Memory.source_analysis_id == source_analysis_id,
+                Memory.kind == kind,
+                Memory.status == MemoryStatus.ACTIVE,
+            )
+        ).all()
+
+    def list_active(
+        self,
+        *,
+        kind: MemoryKind | None,
+        contact_id: uuid.UUID | None,
+        company_id: uuid.UUID | None,
+        opportunity_id: uuid.UUID | None,
+        limit: int,
+        offset: int,
+    ) -> Sequence[Memory]:
+        """The clear, dedicated way to see only what Nerva currently believes —
+        `MemoryService.list`'s default policy goes through this, via `list_filtered`
+        below, rather than every caller remembering to pass `status=active` itself."""
+        return self.list_filtered(
+            kind=kind,
+            origin=None,
+            status=MemoryStatus.ACTIVE,
+            contact_id=contact_id,
+            company_id=company_id,
+            opportunity_id=opportunity_id,
+            limit=limit,
+            offset=offset,
+        )
+
+    def list_filtered(
+        self,
+        *,
+        kind: MemoryKind | None,
+        origin: MemoryOrigin | None,
+        status: MemoryStatus | None,
+        contact_id: uuid.UUID | None,
+        company_id: uuid.UUID | None,
+        opportunity_id: uuid.UUID | None,
+        limit: int,
+        offset: int,
+    ) -> Sequence[Memory]:
+        """General-purpose, explicitly-typed query underlying both `list_active` and
+        `MemoryService.list`. `status=None` applies no status filter at all — the same
+        convention as `ActionRepository.list_filtered`/`BusinessSignalRepository.
+        list_filtered` — so a caller that genuinely needs every lifecycle state at once
+        (e.g. a future audit view) is not blocked; the "active by default" policy that
+        most callers want lives one layer up, in the service, not hidden in here.
+
+        Stable order and limits come from `ScopedRepository._page`: newest (`created_at`)
+        first, `id` as a deterministic tiebreaker, same as every other listing in this
+        module.
+        """
+        statement = self._select()
+        if kind is not None:
+            statement = statement.where(Memory.kind == kind)
+        if origin is not None:
+            statement = statement.where(Memory.origin == origin)
+        if status is not None:
+            statement = statement.where(Memory.status == status)
+        if contact_id is not None:
+            statement = statement.where(Memory.contact_id == contact_id)
+        if company_id is not None:
+            statement = statement.where(Memory.company_id == company_id)
+        if opportunity_id is not None:
+            statement = statement.where(Memory.opportunity_id == opportunity_id)
+        return self._page(statement, limit=limit, offset=offset)
+
+
 class IntegrationRepository(ScopedRepository[Integration]):
     model = Integration
 
@@ -239,6 +369,20 @@ class IntegrationRepository(ScopedRepository[Integration]):
 
     def list_all(self) -> Sequence[Integration]:
         return self.session.scalars(self._select().order_by(Integration.created_at)).all()
+
+    def get_for_provider(self, provider: IntegrationProvider) -> Integration | None:
+        """The workspace's most recently connected integration for `provider`.
+        `send_email` has no `integration_id` of its own to resolve by (see
+        `nerva_actions.payloads`'s module docstring) — this gives
+        `nerva_connect.google.send_executor.GmailSendExecutor` the same single
+        "the Google connection for this workspace" that the rest of Nerva Connect's
+        UI already treats as the normal case; `ensure_connected_integration` is what
+        actually decides whether the row it returns is usable."""
+        return self.session.scalars(
+            self._select()
+            .where(Integration.provider == provider)
+            .order_by(Integration.created_at.desc())
+        ).first()
 
 
 class OpportunityRepository(ScopedRepository[Opportunity]):

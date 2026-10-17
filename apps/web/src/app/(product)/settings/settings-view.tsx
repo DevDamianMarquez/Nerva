@@ -138,6 +138,15 @@ function GmailIntegration({
   };
 
   const connected = integration && integration.status !== "disconnected";
+  // A `connected` integration can still lack `gmail.send` — connected before this
+  // scope was requested, or reconnected under an older scope list. Distinct from
+  // `needs_reauth`: Google has not revoked anything, Nerva just never asked for
+  // permission to send. Treated the same way in the UI (a "reconnect" action fixes
+  // both), but never shown as if it were already fully connected.
+  const needsSendScope = Boolean(
+    connected && integration.status === "connected" && !integration.can_send,
+  );
+  const needsReconnect = !connected || integration?.status === "needs_reauth" || needsSendScope;
 
   return (
     <ul className="divide-y rounded-lg border">
@@ -154,6 +163,8 @@ function GmailIntegration({
                   <Badge variant="destructive">Needs attention</Badge>
                 ) : integration.status === "error" ? (
                   <Badge variant="destructive">Sync failed</Badge>
+                ) : needsSendScope ? (
+                  <Badge variant="outline">Read-only</Badge>
                 ) : (
                   <Badge variant="secondary">Connected</Badge>
                 )}
@@ -161,9 +172,11 @@ function GmailIntegration({
               <p className="text-muted-foreground">
                 {integration.status === "needs_reauth"
                   ? "Reconnect Gmail to keep syncing your conversations."
-                  : integration.last_synced_at
-                    ? `Last synced: ${new Date(integration.last_synced_at).toLocaleString()}`
-                    : "Not synced yet."}
+                  : needsSendScope
+                    ? "Reconnect Gmail to let Nerva send approved emails from this mailbox."
+                    : integration.last_synced_at
+                      ? `Last synced: ${new Date(integration.last_synced_at).toLocaleString()}`
+                      : "Not synced yet."}
               </p>
             </>
           ) : (
@@ -172,8 +185,9 @@ function GmailIntegration({
                 Gmail <Badge variant="outline">Not connected</Badge>
               </p>
               <p className="text-muted-foreground">
-                Read your business conversations so Nerva can help you stay on top of work.
-                Read-only: Nerva cannot send, delete or change anything in your mailbox.
+                Nerva requests permission to read your business conversations and to send email,
+                used only for an action you&rsquo;ve explicitly approved. It cannot delete or change
+                anything else in your mailbox.
               </p>
             </>
           )}
@@ -189,7 +203,7 @@ function GmailIntegration({
           ) : null}
         </div>
         <div className="flex shrink-0 gap-2">
-          {!connected || integration.status === "needs_reauth" ? (
+          {needsReconnect ? (
             <Button onClick={() => void connect()} disabled={connecting}>
               {connecting ? "Redirecting…" : integration ? "Reconnect Gmail" : "Connect Gmail"}
             </Button>
@@ -425,8 +439,8 @@ export function SettingsView() {
           />
         )}
         <p className="mt-3 text-xs text-muted-foreground">
-          Nerva only requests read-only Gmail access. It cannot send, delete or change anything in
-          your mailbox.
+          Nerva requests read access to Gmail, plus permission to send an email only for an
+          action you&rsquo;ve approved. It cannot delete or change anything else in your mailbox.
         </p>
       </SettingsSection>
 

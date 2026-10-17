@@ -6,13 +6,19 @@ these (see `tests/conftest.py`).
 """
 
 import base64
+from collections.abc import Sequence
 from datetime import datetime
 
 from nerva.nerva_connect.google.errors import GoogleApiError, GoogleAuthError
 from nerva.nerva_connect.google.gmail import RawGmailMessage
 from nerva.nerva_connect.google.oauth import GoogleIdentity, GoogleTokens
+from nerva.nerva_connect.google.sender import GmailSendResult
 
-DEFAULT_SCOPE = "openid email https://www.googleapis.com/auth/gmail.readonly"
+DEFAULT_SCOPE = (
+    "openid email https://www.googleapis.com/auth/gmail.readonly "
+    "https://www.googleapis.com/auth/gmail.send"
+)
+READONLY_ONLY_SCOPE = "openid email https://www.googleapis.com/auth/gmail.readonly"
 
 
 class FakeGoogleOAuthClient:
@@ -92,6 +98,27 @@ class FakeGmailClient:
 
     def get_profile(self, access_token: str) -> dict[str, str]:
         return {"emailAddress": "alex@gmail.example"}
+
+
+class FakeGmailSender:
+    """Scripted responses standing in for a real `GmailSender` (Milestone 5 Block 4,
+    `nerva.nerva_connect.google.sender`) — no adapter implements that `Protocol` for
+    real yet. Set `next_result` to control what `send_email` returns, or `fail_with`
+    to make it raise `GoogleAuthError` / `GoogleApiError` instead. Every call is
+    recorded in `calls`, mirroring `tests.fakes.actions.FakeActionExecutor`."""
+
+    def __init__(self, *, result: GmailSendResult | None = None) -> None:
+        self.next_result = result or GmailSendResult(message_id="msg_1", thread_id="thread_1")
+        self.fail_with: GoogleAuthError | GoogleApiError | None = None
+        self.calls: list[tuple[str, Sequence[str], str, str]] = []
+
+    def send_email(
+        self, access_token: str, *, recipients: Sequence[str], subject: str, body: str
+    ) -> GmailSendResult:
+        self.calls.append((access_token, recipients, subject, body))
+        if self.fail_with is not None:
+            raise self.fail_with
+        return self.next_result
 
 
 def _b64(text: str) -> str:

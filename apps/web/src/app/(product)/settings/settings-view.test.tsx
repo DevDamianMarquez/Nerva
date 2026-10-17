@@ -69,6 +69,7 @@ const disconnectedIntegration: Integration = {
   last_synced_at: null,
   last_error: null,
   created_at: "2024-01-01T00:00:00Z",
+  can_send: false,
 };
 
 const connectedIntegration: Integration = {
@@ -76,6 +77,7 @@ const connectedIntegration: Integration = {
   status: "connected",
   external_account_email: "alex@gmail.example",
   last_synced_at: "2024-01-02T09:30:00Z",
+  can_send: true,
 };
 
 function mockData(members: Member[], integrations: Integration[]): void {
@@ -157,6 +159,20 @@ describe("SettingsView", () => {
     expect(
       within(integrations).getByRole("button", { name: "Reconnect Gmail" }),
     ).toBeInTheDocument();
+  });
+
+  it("shows a read-only state and a Reconnect button when the send scope is missing", async () => {
+    mockData([member], [{ ...connectedIntegration, can_send: false }]);
+
+    render(<SettingsView />);
+
+    const integrations = await screen.findByRole("region", { name: "Integrations" });
+    expect(within(integrations).getByText("Read-only")).toBeInTheDocument();
+    expect(within(integrations).queryByText("Connected")).not.toBeInTheDocument();
+    expect(
+      within(integrations).getByRole("button", { name: "Reconnect Gmail" }),
+    ).toBeInTheDocument();
+    expect(within(integrations).queryByRole("button", { name: "Sync now" })).not.toBeInTheDocument();
   });
 
   it("starts the connect flow and redirects the browser to Google", async () => {

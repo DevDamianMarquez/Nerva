@@ -65,7 +65,10 @@ class GmailClient:
         if response.status_code == 401:
             raise GoogleAuthError("Gmail rejected the access token.")
         if response.status_code != 200:
-            raise GoogleApiError(f"Gmail API returned {response.status_code} for {path}.")
+            raise GoogleApiError(
+                f"Gmail API returned {response.status_code} for {path}.",
+                status_code=response.status_code,
+            )
 
         data: dict[str, Any] = response.json()
         return data

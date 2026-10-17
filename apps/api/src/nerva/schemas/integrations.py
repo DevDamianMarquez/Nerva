@@ -1,7 +1,11 @@
 """Schemas for Nerva Connect integrations.
 
 `IntegrationRead` is deliberately narrow: no access token, no refresh token (encrypted
-or not), no raw Google response. Only what the Settings page needs to render a card.
+or not), no raw Google response, no raw OAuth scope string. Only what the Settings
+page needs to render a card — `can_send` included, so the page can tell a fully
+connected integration apart from a readonly-only one without a provider-specific
+scope string (see `nerva.nerva_connect.google.sender.integration_has_send_scope`,
+which `routes.integrations` uses to populate it).
 """
 
 import uuid
@@ -20,6 +24,7 @@ class IntegrationRead(ResponseModel):
     last_synced_at: datetime | None
     last_error: str | None
     created_at: datetime
+    can_send: bool
 
 
 class GoogleConnectResponse(ResponseModel):

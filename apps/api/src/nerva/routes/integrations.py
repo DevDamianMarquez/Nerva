@@ -21,7 +21,9 @@ from nerva.api.deps import (
 )
 from nerva.core.config import Settings
 from nerva.core.errors import ConflictError, ServiceUnavailableError
+from nerva.models import Integration
 from nerva.nerva_connect.google.errors import GoogleApiError, GoogleAuthError
+from nerva.nerva_connect.google.sender import integration_has_send_scope
 from nerva.schemas.common import WORKSPACE_ERRORS, ErrorResponse
 from nerva.schemas.integrations import GoogleConnectResponse, IntegrationRead, SyncResultRead
 from nerva.services.integrations import (
@@ -44,13 +46,31 @@ FORBIDDEN: dict[int | str, dict[str, Any]] = {
 }
 
 
+def _read(integration: Integration) -> IntegrationRead:
+    """`can_send` is not a column on `Integration` — it is derived from the stored
+    `scopes` string via `integration_has_send_scope`, the same check
+    `GmailSendExecutor` makes before actually sending (see
+    `nerva_connect.google.sender`) — so `model_validate` alone cannot populate it."""
+    return IntegrationRead(
+        id=integration.id,
+        workspace_id=integration.workspace_id,
+        provider=integration.provider,
+        status=integration.status,
+        external_account_email=integration.external_account_email,
+        last_synced_at=integration.last_synced_at,
+        last_error=integration.last_error,
+        created_at=integration.created_at,
+        can_send=integration_has_send_scope(integration),
+    )
+
+
 @router.get("", response_model=list[IntegrationRead])
 def list_integrations(
     workspace_id: uuid.UUID, ctx: WorkspaceCtx, session: SessionDep, oauth_client: GoogleOAuthDep
 ) -> list[IntegrationRead]:
     """Any workspace member may view what is connected."""
     return [
-        IntegrationRead.model_validate(integration)
+        _read(integration)
         for integration in IntegrationService(session, ctx, oauth_client=oauth_client).list()
     ]
 
@@ -128,7 +148,7 @@ def disconnect_integration(
     """Owner-only. Revokes the credential; imported conversations and messages are
     kept (see `IntegrationService.disconnect`)."""
     service = IntegrationService(session, ctx, oauth_client=oauth_client)
-    return IntegrationRead.model_validate(service.disconnect(integration_id))
+    return _read(service.disconnect(integration_id))
 
 
 @callback_router.get("/google/callback", include_in_schema=False)

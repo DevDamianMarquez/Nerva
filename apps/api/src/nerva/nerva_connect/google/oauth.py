@@ -1,4 +1,4 @@
-"""Google OAuth 2.0 for a server-side web app, scoped to read-only Gmail.
+"""Google OAuth 2.0 for a server-side web app.
 
 Only `google-auth` is used here (for verifying the ID token's signature — not
 something to hand-roll, see `verify_id_token`); the authorization/token-exchange HTTP
@@ -22,9 +22,16 @@ TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"  # noqa: S105 (a URL, not
 REVOKE_ENDPOINT = "https://oauth2.googleapis.com/revoke"
 
 # openid+email identify the connected account (a stable `sub`, and an email for
-# display only); gmail.readonly is the only Gmail permission requested, and the only
-# one this milestone needs — see docs/MVP.md's read-only scope boundary.
-SCOPES = "openid email https://www.googleapis.com/auth/gmail.readonly"
+# display only). gmail.readonly (Milestone 3) lets Nerva import mail; gmail.send
+# (Milestone 5 Block 5) lets an approved `send_email` action actually send through
+# the connected mailbox — nothing else is ever requested. Every *new* connect (or
+# reconnect) requests both scopes together; an account connected before Block 5 only
+# holds `gmail.readonly` in its stored `Integration.scopes` until it reconnects (see
+# `nerva_connect.google.sender.ensure_send_scope_granted`).
+SCOPE_IDENTITY = "openid email"
+SCOPE_GMAIL_READONLY = "https://www.googleapis.com/auth/gmail.readonly"
+SCOPE_GMAIL_SEND = "https://www.googleapis.com/auth/gmail.send"
+SCOPES = f"{SCOPE_IDENTITY} {SCOPE_GMAIL_READONLY} {SCOPE_GMAIL_SEND}"
 
 _TIMEOUT = httpx.Timeout(10.0)
 
