@@ -56,9 +56,41 @@ class MessageDirection(StrEnum):
 
 
 class MemoryKind(StrEnum):
+    """What a memory is *about* — orthogonal to `MemoryOrigin`, which says how
+    certain Nerva is that it's true. A `PREFERENCE` can be directly stated
+    (observed) or guessed from behavior (inferred), same as a `FACT`."""
+
     FACT = "fact"
     PREFERENCE = "preference"
     NOTE = "note"
+
+
+class MemoryOrigin(StrEnum):
+    """How a memory's content came to be: stated directly in its source
+    (`observed`), or derived/guessed by a model (`inferred`). An inference never
+    silently becomes an observation — see `nerva.nerva_memory.lifecycle`."""
+
+    OBSERVED = "observed"
+    INFERRED = "inferred"
+
+
+class MemoryStatus(StrEnum):
+    """active -> superseded | discarded. Both terminal — see
+    `nerva.nerva_memory.lifecycle`."""
+
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+    DISCARDED = "discarded"
+
+
+class MemorySourceType(StrEnum):
+    """What produced a memory: an entire conversation, a completed
+    `ConversationAnalysis`, or a human/Nerva recording it with no upstream
+    artifact at all (`manual`)."""
+
+    CONVERSATION = "conversation"
+    ANALYSIS = "analysis"
+    MANUAL = "manual"
 
 
 class IntegrationProvider(StrEnum):
@@ -99,6 +131,9 @@ class ActivityEventType(StrEnum):
     BUSINESS_SIGNAL_CREATED = "business_signal.created"
     BUSINESS_SIGNAL_CONFIRMED = "business_signal.confirmed"
     BUSINESS_SIGNAL_DISMISSED = "business_signal.dismissed"
+    MEMORY_RECORDED = "memory.recorded"
+    MEMORY_SUPERSEDED = "memory.superseded"
+    MEMORY_DISCARDED = "memory.discarded"
 
 
 class AnalysisStatus(StrEnum):
