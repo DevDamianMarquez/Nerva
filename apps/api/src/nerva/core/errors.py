@@ -68,6 +68,15 @@ class InvalidReferenceError(NervaError):
     code = "invalid_reference"
 
 
+class InvalidContentError(NervaError):
+    """A request body's structured content does not satisfy its domain contract (e.g.
+    `nerva_memory.content.MemoryContent`). Distinct from `InvalidReferenceError`: this is
+    about the *shape* of the content itself, not a dangling id."""
+
+    status_code = 422
+    code = "invalid_content"
+
+
 class ServiceUnavailableError(NervaError):
     """A required external dependency is not configured or could not be reached
     (e.g. Google OAuth credentials are not set). Distinct from a 500: the request
@@ -89,6 +98,20 @@ class RateLimitedError(NervaError):
 
 class ImmutableRecordError(RuntimeError):
     """Raised when code attempts to modify or delete an append-only record."""
+
+
+class DataIntegrityError(RuntimeError):
+    """Raised when a service observes already-persisted data that violates an
+    invariant it relies on but did not cause in this call — e.g. more than one
+    active memory where the design permits at most one, or a `COMPLETED` row
+    missing a field every `COMPLETED` row is expected to carry (see
+    `nerva.services.memory_formation`). Signals a bug upstream — a concurrent
+    writer, an old release, or a direct write that bypassed the service layer —
+    never something the current request caused or can fix by retrying. Like
+    `ImmutableRecordError`, this is a plain `RuntimeError`, not a `NervaError`:
+    it is never mapped to a specific HTTP response and is left to surface as an
+    unhandled 500, so it is never silently swallowed or papered over with an
+    arbitrary choice."""
 
 
 def _error_body(code: str, message: str, details: Any = None) -> dict[str, Any]:

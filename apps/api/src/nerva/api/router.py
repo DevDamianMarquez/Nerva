@@ -11,6 +11,7 @@ from nerva.routes import (
     contacts,
     conversations,
     integrations,
+    memory,
     opportunities,
     signals,
     workspaces,
@@ -29,3 +30,4 @@ api_router.include_router(integrations.router)
 api_router.include_router(integrations.callback_router)
 api_router.include_router(analysis.router)
 api_router.include_router(signals.router)
+api_router.include_router(memory.router)

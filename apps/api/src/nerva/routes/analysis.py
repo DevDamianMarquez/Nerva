@@ -1,12 +1,31 @@
 """AI analysis of conversations: analyze/re-analyze one conversation, and a
 bounded, owner-only backfill across a workspace.
 
-Orchestrates `AnalysisService` (analysis only) and `SignalService`
-(deterministic signal materialization only) — this module decides *when* to
-call each, never *what* either of them decides on its own. No AI/business rule
-is duplicated here.
+Orchestrates `AnalysisService` (analysis only), `SignalService` (deterministic
+signal materialization only), and `MemoryFormationService` (the one automated
+`estimated_value` fact memory, M6.3) — this module decides *when* to call
+each, never *what* any of them decides on its own. No AI/business rule is
+duplicated here.
+
+Memory formation always runs last, after analysis and signal materialization
+have already committed: a `DataIntegrityError` or `InvalidStateTransitionError`
+from it (see `nerva.services.memory_formation`'s module docstring and
+`backfill_analysis`'s own comments — these are the two documented, non-bug
+failures that service can raise for reasons outside this call's control: a
+pre-existing data inconsistency, or a live race with another resolution of
+the same memory) must never be mistaken for an AI/signal failure, and must
+never silently turn into a misleading success either. In
+`analyze_conversation`, both are left uncaught, exactly like `SignalService`'s
+call just above it — the request fails (500 or 409, respectively) rather than
+return a 200 that omits a fact formation was supposed to produce. In
+`backfill_analysis`, one conversation's memory-formation failure is isolated
+the same way an `AnalysisService` failure already is: logged, counted via the
+batch's existing `failed` counter, and never allowed to abort the remaining
+conversations — see that route's own comments for how `considered == analyzed
++ cached + failed` stays true without double-counting.
 """
 
+import logging
 import uuid
 from typing import NoReturn
 
@@ -14,7 +33,13 @@ from fastapi import APIRouter, Query
 
 from nerva.api.deps import AIClientDep, SessionDep, WorkspaceCtx
 from nerva.core.enums import BusinessSignalStatus, BusinessSignalType, MemberRole
-from nerva.core.errors import AuthorizationError, RateLimitedError, ServiceUnavailableError
+from nerva.core.errors import (
+    AuthorizationError,
+    DataIntegrityError,
+    InvalidStateTransitionError,
+    RateLimitedError,
+    ServiceUnavailableError,
+)
 from nerva.nerva_ai.prompts import PROMPT_VERSION
 from nerva.nerva_ai.schemas import SCHEMA_VERSION
 from nerva.schemas.analysis import AnalysisBackfillResult
@@ -28,7 +53,10 @@ from nerva.services.analysis import (
     AnalysisService,
 )
 from nerva.services.conversations import ConversationService
+from nerva.services.memory_formation import MemoryFormationService
 from nerva.services.signals import SignalService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/workspaces/{workspace_id}",
@@ -105,6 +133,10 @@ def analyze_conversation(
         _raise_for_ai_failure(exc)
 
     SignalService(session, ctx).materialize_potential_opportunity(conversation_id)
+    # Left uncaught on purpose — see the module docstring. A `DataIntegrityError`
+    # here must 500 the request, never return a 200 that silently omits the
+    # memory this analysis was otherwise supposed to produce.
+    MemoryFormationService(session, ctx).form_estimated_value_memory(conversation_id)
     return ConversationAnalysisRead.model_validate(analysis)
 
 
@@ -131,6 +163,7 @@ def backfill_analysis(
     conversations = ConversationService(session, ctx)
     analysis_service = AnalysisService(session, ctx, ai_client=ai_client)
     signal_service = SignalService(session, ctx)
+    memory_formation = MemoryFormationService(session, ctx)
 
     considered = analyzed = cached = failed = signals_created = 0
 
@@ -156,11 +189,6 @@ def backfill_analysis(
             failed += 1
             continue
 
-        if result.attempts > attempts_before:
-            analyzed += 1
-        else:
-            cached += 1
-
         signal = signal_service.materialize_potential_opportunity(conversation.id)
         if (
             signal is not None
@@ -168,6 +196,42 @@ def backfill_analysis(
             and not was_actionable_before
         ):
             signals_created += 1
+
+        # Isolated per conversation, same as an AnalysisService failure above.
+        # Two distinct, non-bug failures can reach here, both documented on
+        # `MemoryFormationService.form_estimated_value_memory` and its module
+        # docstring — never something retrying immediately would fix, but
+        # also never a reason to abort every other conversation in this
+        # batch: `DataIntegrityError` for pre-existing, inconsistent data (more
+        # than one active FACT memory already sourced from this analysis), and
+        # `InvalidStateTransitionError` for a *live* race — the memory this
+        # analysis would supersede was just resolved by someone else (e.g. a
+        # human calling `POST /memories/{id}/replace` or `/supersede` directly)
+        # in the window between this service's own read and its locking
+        # re-read (see `test_memory_formation.py`'s own
+        # `test_a_concurrent_external_resolution_of_the_active_memory_raises_
+        # invalid_state_transition`).
+        # The analysis and signal this conversation already produced stay
+        # committed either way; only this conversation's own outcome is
+        # counted as `failed` instead of `analyzed`/`cached`, so `considered ==
+        # analyzed + cached + failed` still holds with no double-counting.
+        try:
+            memory_formation.form_estimated_value_memory(conversation.id)
+        except (DataIntegrityError, InvalidStateTransitionError):
+            logger.error(
+                "Memory formation failed for conversation %s in workspace %s "
+                "(analysis and signal materialization already committed).",
+                conversation.id,
+                workspace_id,
+                exc_info=True,
+            )
+            failed += 1
+            continue
+
+        if result.attempts > attempts_before:
+            analyzed += 1
+        else:
+            cached += 1
 
     return AnalysisBackfillResult(
         considered=considered,
