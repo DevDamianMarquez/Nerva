@@ -12,13 +12,28 @@ appending a new one, the same way `Integration` is a single mutable row rather
 than a log of every sync — the *history* of what happened is the `ActivityEvent`
 trail (`conversation.analyzed` / `conversation.analysis_failed`), recorded by
 whatever writes this row, not a second copy kept here.
+
+`memory_ids_used` (M6.4 Block 4) is the audit snapshot of exactly which `Memory`
+rows (Block 1/2's authoritative selection — `nerva_core.memory_context.
+select_context_memories` via `MemoryContextService`) were folded into
+`AnalysisInput.memory_context` when this row's *current* result was produced —
+see `nerva.services.analysis._persist_success`, the only writer. Deliberately a
+plain `UUID[]`, not a foreign key: a `Memory` later superseded or discarded must
+never retroactively change what this row says was actually used to produce its
+result (and `Memory` rows are never physically deleted at the application layer
+at all — see `nerva.nerva_memory.lifecycle` — so there is no live-reference
+problem to guard against either). Order matches selection order exactly; `[]`
+means no relevant memory existed at the time. This column is internal audit
+data, never serialized to the API (see `nerva.schemas.crm.ConversationAnalysisRead`,
+which does not declare it — Pydantic's `from_attributes` only ever serializes
+fields a schema explicitly lists).
 """
 
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import BigInteger, String, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import BigInteger, String, Text, UniqueConstraint, Uuid
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from nerva.core.enums import (
@@ -94,5 +109,10 @@ class ConversationAnalysis(WorkspaceOwnedModel, UpdatedAtMixin):
     input_tokens: Mapped[int | None]
     output_tokens: Mapped[int | None]
     latency_ms: Mapped[int | None]
+
+    # --- Audit (M6.4 Block 4): see the module docstring. -------------------------
+    memory_ids_used: Mapped[list[uuid.UUID]] = mapped_column(
+        ARRAY(Uuid()), default=list, server_default="{}"
+    )
 
     analyzed_at: Mapped[datetime | None]  # set only when a run completes successfully

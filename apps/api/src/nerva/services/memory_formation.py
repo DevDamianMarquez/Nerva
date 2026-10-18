@@ -70,6 +70,56 @@ that one atomic operation — this method used to call `remember(commit=False)`
 then `supersede(commit=True)` by hand to get the same guarantee; see
 `MemoryService`'s module docstring for why `replace` exists and what it
 composes.
+
+## Subject resolution (M6.4 Block 3 correction)
+
+An `estimated_value` fact is about one specific deal, never the workspace at
+large. `_resolve_subject` decides what that deal's subject is, in strict
+priority order, and `decide_memory_formation` (`nerva_core.memory_rules`)
+stays completely ignorant of all of this — it only ever compares values and
+fingerprints, exactly as before this correction:
+
+1. **`opportunity_id`** — if exactly one `Opportunity` in this workspace names
+   this conversation (`OpportunityRepository.get_by_conversation`, M6.4 Block
+   2), use it. `Opportunity.conversation_id` carries no unique constraint
+   (`nerva.models.crm`), so *more than one* is a real, legitimate case, not a
+   bug — and this module never picks one arbitrarily among them.
+2. **`contact_id`** — only if step 1 did not resolve (no linked opportunity,
+   or more than one), fall back to `conversation.contact_id` if it is set.
+3. **No subject** — if neither resolves, `form_estimated_value_memory` does
+   not write anything at all. A `Memory` with no subject means "this concerns
+   the workspace as a whole" (`nerva.models.memory`'s own docstring) — that
+   is never an honest description of one deal's value just because entity
+   resolution failed for it, so this module never produces that row instead.
+   No `company_id` fallback either: a company is broader than a contact, and
+   this deal-specific fact is no truer of "the whole company" than it is of
+   "the whole workspace" when neither a contact nor an opportunity is known.
+
+**CREATE** resolves the subject fresh, at the moment of creation, since there
+is nothing yet to compare it against. If it resolves to nothing, the CREATE
+that `decide_memory_formation` would otherwise perform is downgraded to a
+no-write NOOP by this module — `decide_memory_formation`'s own decision
+(driven purely by value/fingerprint) is unchanged; only whether this module
+*acts* on a `CREATE` it returned is conditional on a subject existing.
+
+**SUPERSEDE pins the subject to whatever the memory being replaced already
+has — it never re-resolves it.** `decide_memory_formation` only returns
+`SUPERSEDE` when the *value* changed; nothing about resolving a `SUPERSEDE`
+requires (or by itself implies) that the *subject* should change too, and a
+memory that was successfully created always has exactly one of `contact_id`/
+`opportunity_id` set (see above), so there is never a "no subject to pin to"
+case here. This is a deliberate, narrow decision, not an oversight: if an
+`Opportunity` gets linked to a conversation *after* a `contact`-scoped
+`estimated_value` memory already exists for it, a later value change will
+still supersede that memory under its original `contact_id` — never silently
+"upgrade" it to the now-resolvable `opportunity_id`. Re-parenting an existing
+fact thread to a newly-discovered subject is a real product decision (does
+the old belief's history move with it? does any consumer of the old subject
+need to know?) that the current model does not define, and this module does
+not invent an answer to it. The practical effect is narrow: the one
+conversation whose `Opportunity` link arrived after its first `estimated_
+value` memory stays `contact`-scoped for that fact going forward, until this
+is explicitly revisited.
 """
 
 import uuid
@@ -80,7 +130,7 @@ from sqlalchemy.orm import Session
 from nerva.core.context import Actor, WorkspaceContext
 from nerva.core.enums import AnalysisStatus, MemoryKind, MemoryOrigin
 from nerva.core.errors import DataIntegrityError, NotFoundError
-from nerva.models import ConversationAnalysis, Memory
+from nerva.models import Conversation, ConversationAnalysis, Memory
 from nerva.nerva_core.memory_rules import (
     EstimatedValueObservation,
     ExistingEstimatedValueMemory,
@@ -91,6 +141,7 @@ from nerva.repositories.workspace_data import (
     ConversationAnalysisRepository,
     ConversationRepository,
     MemoryRepository,
+    OpportunityRepository,
 )
 from nerva.services.base import ScopedService
 from nerva.services.memory import MemoryService
@@ -150,7 +201,23 @@ class MemoryFormationService(ScopedService):
         self.conversations = ConversationRepository(session, ctx.workspace_id)
         self.analyses = ConversationAnalysisRepository(session, ctx.workspace_id)
         self.memories = MemoryRepository(session, ctx.workspace_id)
+        self.opportunities = OpportunityRepository(session, ctx.workspace_id)
         self.memory_service = MemoryService(session, ctx)
+
+    def _resolve_subject(
+        self, conversation: Conversation
+    ) -> tuple[uuid.UUID | None, uuid.UUID | None]:
+        """`(contact_id, opportunity_id)`, with at most one set — see the
+        module docstring's "Subject resolution" for the exact priority order
+        and why there is no `company_id` fallback. Both `None` means no
+        subject resolves at all; the caller must never write a `Memory` in
+        that case (see the module docstring)."""
+        opportunities = self.opportunities.get_by_conversation(conversation.id)
+        if len(opportunities) == 1:
+            return None, opportunities[0].id
+        if conversation.contact_id is not None:
+            return conversation.contact_id, None
+        return None, None
 
     def form_estimated_value_memory(self, conversation_id: uuid.UUID) -> Memory | None:
         """Evaluates the conversation's current completed analysis against
@@ -158,10 +225,12 @@ class MemoryFormationService(ScopedService):
         supersedes, or leaves alone the `estimated_value` fact memory
         accordingly. Returns the current active memory for this fact (which
         may be the one just created, the one left untouched, or `None` if
-        there has never been a valid estimate). Raises `NotFoundError` if
-        `conversation_id` is not in this workspace. Safe to call repeatedly —
-        see the module docstring for the concurrency and staleness guarantees
-        this relies on."""
+        there has never been a valid estimate *or* if one exists but no
+        unambiguous `Opportunity`/`contact_id` subject resolves for this
+        conversation — see the module docstring's "Subject resolution").
+        Raises `NotFoundError` if `conversation_id` is not in this workspace.
+        Safe to call repeatedly — see the module docstring for the
+        concurrency and staleness guarantees this relies on."""
         conversation = self.conversations.get(conversation_id)
         if conversation is None:
             raise NotFoundError("Conversation not found.")
@@ -224,13 +293,24 @@ class MemoryFormationService(ScopedService):
         confidence_for_memory = None if observation.value_is_explicit else confidence
 
         if decision == MemoryFormationDecision.CREATE:
+            contact_id, opportunity_id = self._resolve_subject(conversation)
+            if contact_id is None and opportunity_id is None:
+                # No unambiguous Opportunity and no known contact: never
+                # promote this to a WORKSPACE-level memory — see the module
+                # docstring's "Subject resolution". `decide_memory_formation`
+                # said CREATE based on value/fingerprint alone; this module
+                # declines to act on it. No existing memory for this fact
+                # exists either (CREATE only happens when `existing_memory`
+                # is `None`), so there is nothing to return but `None`.
+                return None
             return self.memory_service.remember(
                 kind=MemoryKind.FACT,
                 origin=origin,
                 content=content,
                 observed_at=analyzed_at,
                 confidence=confidence_for_memory,
-                contact_id=conversation.contact_id,
+                contact_id=contact_id,
+                opportunity_id=opportunity_id,
                 source_analysis_id=analysis.id,
                 actor=Actor.nerva(),
                 commit=True,
@@ -243,6 +323,13 @@ class MemoryFormationService(ScopedService):
                 "decide_memory_formation returned SUPERSEDE with no existing active "
                 "memory to supersede — see nerva_core.memory_rules's decision table."
             )
+        # Subject is pinned to whatever `existing_memory` already has, never
+        # re-resolved — see the module docstring's "Subject resolution" for
+        # why re-parenting to a since-discovered Opportunity is an explicit
+        # future decision, not made here. A successfully created memory
+        # always has exactly one of these two set, so this is never `(None,
+        # None)` here the way it can be for CREATE.
+        #
         # `replace` is the single commit for this whole create-and-resolve
         # operation (M6.3 Block 2): the new memory, its MEMORY_RECORDED event,
         # this resolution, and MEMORY_SUPERSEDED all land in one transaction.
@@ -258,7 +345,8 @@ class MemoryFormationService(ScopedService):
             content=content,
             observed_at=analyzed_at,
             confidence=confidence_for_memory,
-            contact_id=conversation.contact_id,
+            contact_id=existing_memory.contact_id,
+            opportunity_id=existing_memory.opportunity_id,
             source_analysis_id=analysis.id,
             actor=Actor.nerva(),
             commit=True,

@@ -3,7 +3,7 @@
 import uuid
 from collections.abc import Sequence
 
-from sqlalchemy import Row, or_, select
+from sqlalchemy import Row, and_, or_, select
 
 from nerva.core.enums import (
     ActionStatus,
@@ -353,6 +353,64 @@ class MemoryRepository(ScopedRepository[Memory]):
             statement = statement.where(Memory.opportunity_id == opportunity_id)
         return self._page(statement, limit=limit, offset=offset)
 
+    def list_candidates_for_context(
+        self,
+        *,
+        contact_id: uuid.UUID | None,
+        company_id: uuid.UUID | None,
+        opportunity_id: uuid.UUID | None,
+    ) -> Sequence[Memory]:
+        """Every `ACTIVE` memory in this workspace that could possibly be
+        relevant to an already-resolved subject chain — a workspace-level
+        memory (no subject at all) plus any memory whose subject exactly
+        matches one of `contact_id`/`company_id`/`opportunity_id` — expressed
+        as a single workspace-scoped query (via `_select()`, which already
+        filters by `workspace_id`) rather than loading every memory in the
+        workspace and filtering in Python.
+
+        Deliberately wider than any final selection, and deliberately not
+        ranked here: `nerva_core.memory_context.select_context_memories`
+        remains the sole authority on which of these candidates is actually
+        used and in what order (including self-reference exclusion, which
+        this method does not apply) — this only narrows what reaches it, by
+        subject and status, never by relevance.
+
+        Deliberately **no `limit`**: an earlier version of this method took
+        one as a "safety ceiling" independent of a caller's `max_items`, but
+        that was wrong — this method's `created_at` ordering does not match
+        the selector's own ranking criteria (`scope`, then `origin`, then
+        `observed_at`, then `id`; see `nerva_core.memory_context`), so any cap
+        applied *before* the selector runs could silently drop a
+        higher-priority candidate (e.g. an opportunity-scoped fact) in favor
+        of a merely more recently-recorded, lower-priority one (e.g. an old
+        workspace-level note) that the selector would otherwise have ranked
+        below it or dropped itself. `select_context_memories` must see the
+        *complete* eligible candidate set to be the authority its own module
+        docstring claims it is — truncating upstream of it, for any reason,
+        reintroduces exactly the bug this docstring is now warning against.
+        See `nerva.services.memory_context`'s module docstring for the full
+        argument and why no cap is reintroduced there either, for now.
+        """
+        no_subject = and_(
+            Memory.contact_id.is_(None),
+            Memory.company_id.is_(None),
+            Memory.opportunity_id.is_(None),
+        )
+        subject_filters = [no_subject]
+        if contact_id is not None:
+            subject_filters.append(Memory.contact_id == contact_id)
+        if company_id is not None:
+            subject_filters.append(Memory.company_id == company_id)
+        if opportunity_id is not None:
+            subject_filters.append(Memory.opportunity_id == opportunity_id)
+
+        statement = (
+            self._select()
+            .where(Memory.status == MemoryStatus.ACTIVE, or_(*subject_filters))
+            .order_by(Memory.created_at.desc(), Memory.id)
+        )
+        return self.session.scalars(statement).all()
+
 
 class IntegrationRepository(ScopedRepository[Integration]):
     model = Integration
@@ -395,6 +453,23 @@ class OpportunityRepository(ScopedRepository[Opportunity]):
         if stage is not None:
             statement = statement.where(Opportunity.stage == stage)
         return self._page(statement, limit=limit, offset=offset)
+
+    def get_by_conversation(self, conversation_id: uuid.UUID) -> Sequence[Opportunity]:
+        """Every `Opportunity` in this workspace whose `conversation_id`
+        names this conversation as where it was identified. Returns a
+        `Sequence`, not a single optional row, for the same reason
+        `MemoryRepository.get_active_for_analysis` does: `Opportunity.
+        conversation_id` (`nerva.models.crm`) carries no unique constraint —
+        a human can link more than one `Opportunity` to the same conversation
+        (e.g. two independent deals surfaced from the same thread, or two
+        separate `POST /opportunities` calls naming the same conversation),
+        so "the opportunity for this conversation" is not something this
+        method, or the schema, can promise is singular. A caller that needs
+        "exactly one, or none" must decide that for itself from this result,
+        never assume it."""
+        return self.session.scalars(
+            self._select().where(Opportunity.conversation_id == conversation_id)
+        ).all()
 
 
 class ActionRepository(ScopedRepository[Action]):

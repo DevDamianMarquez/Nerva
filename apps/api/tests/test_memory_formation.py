@@ -37,7 +37,15 @@ from nerva.core.enums import (
     MemoryStatus,
 )
 from nerva.core.errors import DataIntegrityError, InvalidStateTransitionError, NotFoundError
-from nerva.models import Contact, Conversation, ConversationAnalysis, Memory, User, Workspace
+from nerva.models import (
+    Contact,
+    Conversation,
+    ConversationAnalysis,
+    Memory,
+    Opportunity,
+    User,
+    Workspace,
+)
 from nerva.repositories.workspace_data import ConversationAnalysisRepository, MemoryRepository
 from nerva.services.activity import ActivityService
 from nerva.services.memory import MemoryService
@@ -87,6 +95,24 @@ def _conversation(
     session.add(conversation)
     session.flush()
     return conversation
+
+
+def _opportunity(
+    session: Session,
+    workspace: Workspace,
+    *,
+    conversation_id: uuid.UUID | None = None,
+    title: str = "Deal",
+) -> Opportunity:
+    opportunity = Opportunity(
+        workspace_id=workspace.id,
+        title=title,
+        conversation_id=conversation_id,
+        created_by_type=ActorType.NERVA,
+    )
+    session.add(opportunity)
+    session.flush()
+    return opportunity
 
 
 def _completed_analysis(
@@ -147,8 +173,13 @@ def make_service(db_session: Session) -> MakeFormationService:
 def test_forming_memory_from_an_explicit_estimate_creates_an_observed_memory(
     db_session: Session, make_service: MakeFormationService
 ) -> None:
+    """Uses a conversation with a contact — not about subject resolution
+    itself (see the dedicated "G. Subject resolution" section below), but a
+    subject must resolve for anything to be created at all (M6.4 Block 3
+    correction: see `nerva.services.memory_formation`'s module docstring)."""
     workspace = _workspace(db_session)
-    conversation = _conversation(db_session, workspace)
+    contact = _contact(db_session, workspace)
+    conversation = _conversation(db_session, workspace, contact_id=contact.id)
     analysis = _completed_analysis(
         db_session, workspace, conversation, fingerprint="fp-1", value_is_explicit=True
     )
@@ -164,7 +195,7 @@ def test_forming_memory_from_an_explicit_estimate_creates_an_observed_memory(
     assert memory.source_type == MemorySourceType.ANALYSIS
     assert memory.source_analysis_id == analysis.id
     assert memory.source_fingerprint == "fp-1"
-    assert memory.contact_id is None
+    assert memory.contact_id == contact.id
     assert memory.content["attributes"] == {
         "estimated_value_cents": 150_000,
         "value_currency": "USD",
@@ -177,7 +208,8 @@ def test_forming_memory_from_an_inferred_estimate_creates_an_inferred_memory_wit
     db_session: Session, make_service: MakeFormationService
 ) -> None:
     workspace = _workspace(db_session)
-    conversation = _conversation(db_session, workspace)
+    contact = _contact(db_session, workspace)
+    conversation = _conversation(db_session, workspace, contact_id=contact.id)
     _completed_analysis(
         db_session, workspace, conversation, value_is_explicit=False, confidence=0.65
     )
@@ -190,9 +222,11 @@ def test_forming_memory_from_an_inferred_estimate_creates_an_inferred_memory_wit
     assert memory.confidence == 0.65
 
 
-def test_the_memorys_subject_is_the_conversations_contact_when_known(
+def test_the_memorys_subject_falls_back_to_contact_when_no_opportunity_resolves(
     db_session: Session, make_service: MakeFormationService
 ) -> None:
+    """Priority order (M6.4 Block 3 correction): opportunity, then contact.
+    No opportunity is linked here, so contact is the correct fallback."""
     workspace = _workspace(db_session)
     contact = _contact(db_session, workspace)
     conversation = _conversation(db_session, workspace, contact_id=contact.id)
@@ -208,6 +242,177 @@ def test_the_memorys_subject_is_the_conversations_contact_when_known(
 
 
 # ---------------------------------------------------------------------------
+# A2. Subject resolution policy (M6.4 Block 3 correction): opportunity,
+#     then contact, then no memory at all — never a WORKSPACE-level
+#     estimated_value memory. See `nerva.services.memory_formation`'s
+#     module docstring, "Subject resolution".
+# ---------------------------------------------------------------------------
+
+
+def test_exactly_one_opportunity_takes_priority_over_a_known_contact(
+    db_session: Session, make_service: MakeFormationService
+) -> None:
+    workspace = _workspace(db_session)
+    contact = _contact(db_session, workspace)
+    conversation = _conversation(db_session, workspace, contact_id=contact.id)
+    opportunity = _opportunity(db_session, workspace, conversation_id=conversation.id)
+    _completed_analysis(db_session, workspace, conversation)
+    service = make_service(workspace)
+
+    memory = service.form_estimated_value_memory(conversation.id)
+
+    assert memory is not None
+    assert memory.opportunity_id == opportunity.id
+    assert memory.contact_id is None
+    assert memory.company_id is None
+
+
+def test_exactly_one_opportunity_resolves_even_with_no_known_contact(
+    db_session: Session, make_service: MakeFormationService
+) -> None:
+    workspace = _workspace(db_session)
+    conversation = _conversation(db_session, workspace)  # no contact_id
+    opportunity = _opportunity(db_session, workspace, conversation_id=conversation.id)
+    _completed_analysis(db_session, workspace, conversation)
+    service = make_service(workspace)
+
+    memory = service.form_estimated_value_memory(conversation.id)
+
+    assert memory is not None
+    assert memory.opportunity_id == opportunity.id
+    assert memory.contact_id is None
+
+
+def test_multiple_linked_opportunities_never_pick_one_arbitrarily_falls_back_to_contact(
+    db_session: Session, make_service: MakeFormationService
+) -> None:
+    """`Opportunity.conversation_id` carries no unique constraint
+    (`nerva.models.crm`) — a conversation may legitimately have more than
+    one. This module never picks one arbitrarily; with a known contact, it
+    falls back to it instead (same priority order as when no opportunity
+    resolves at all)."""
+    workspace = _workspace(db_session)
+    contact = _contact(db_session, workspace)
+    conversation = _conversation(db_session, workspace, contact_id=contact.id)
+    _opportunity(db_session, workspace, conversation_id=conversation.id, title="Deal A")
+    _opportunity(db_session, workspace, conversation_id=conversation.id, title="Deal B")
+    _completed_analysis(db_session, workspace, conversation)
+    service = make_service(workspace)
+
+    memory = service.form_estimated_value_memory(conversation.id)
+
+    assert memory is not None
+    assert memory.contact_id == contact.id
+    assert memory.opportunity_id is None
+
+
+def test_multiple_linked_opportunities_and_no_contact_forms_no_memory(
+    db_session: Session, make_service: MakeFormationService
+) -> None:
+    workspace = _workspace(db_session)
+    conversation = _conversation(db_session, workspace)  # no contact_id
+    _opportunity(db_session, workspace, conversation_id=conversation.id, title="Deal A")
+    _opportunity(db_session, workspace, conversation_id=conversation.id, title="Deal B")
+    _completed_analysis(db_session, workspace, conversation)
+    service = make_service(workspace)
+
+    memory = service.form_estimated_value_memory(conversation.id)
+
+    assert memory is None
+    assert MemoryRepository(db_session, workspace.id).list() == []
+
+
+def test_no_contact_and_no_opportunity_forms_no_memory(
+    db_session: Session, make_service: MakeFormationService
+) -> None:
+    workspace = _workspace(db_session)
+    conversation = _conversation(db_session, workspace)  # no contact_id, no opportunity
+    _completed_analysis(db_session, workspace, conversation)
+    service = make_service(workspace)
+
+    memory = service.form_estimated_value_memory(conversation.id)
+
+    assert memory is None
+    assert MemoryRepository(db_session, workspace.id).list() == []
+
+
+def test_declining_to_form_for_lack_of_subject_still_returns_none_on_a_later_call(
+    db_session: Session, make_service: MakeFormationService
+) -> None:
+    """Safe to call repeatedly: a conversation that never resolves a subject
+    stays a no-op every time, never raises, and never retroactively guesses
+    a subject from a later call alone (nothing about the conversation
+    changed between calls here)."""
+    workspace = _workspace(db_session)
+    conversation = _conversation(db_session, workspace)
+    _completed_analysis(db_session, workspace, conversation, fingerprint="fp-1")
+    service = make_service(workspace)
+
+    first = service.form_estimated_value_memory(conversation.id)
+    second = service.form_estimated_value_memory(conversation.id)
+
+    assert first is None
+    assert second is None
+
+
+def test_no_estimated_value_memory_ever_has_no_subject_at_all(
+    db_session: Session, make_service: MakeFormationService
+) -> None:
+    """Cross-check over every scenario in this section: whenever a memory
+    *is* formed, it always has exactly one of `contact_id`/`opportunity_id`
+    set — never all three subject columns `NULL` (which `nerva.models.
+    memory`'s own docstring defines as "concerns the workspace as a
+    whole") — because an `estimated_value` fact is never that."""
+    workspace = _workspace(db_session)
+    contact = _contact(db_session, workspace)
+
+    with_contact = _conversation(db_session, workspace, contact_id=contact.id, subject="A")
+    _completed_analysis(db_session, workspace, with_contact, fingerprint="fp-a")
+
+    without_subject = _conversation(db_session, workspace, subject="B")
+    _completed_analysis(db_session, workspace, without_subject, fingerprint="fp-b")
+
+    service = make_service(workspace)
+    service.form_estimated_value_memory(with_contact.id)
+    service.form_estimated_value_memory(without_subject.id)
+
+    for memory in MemoryRepository(db_session, workspace.id).list():
+        assert memory.contact_id is not None or memory.opportunity_id is not None, (
+            f"memory {memory.id} has no subject at all — it would be treated as "
+            "WORKSPACE-level, which an estimated_value fact must never be"
+        )
+
+
+def test_a_changed_estimate_supersedes_under_the_same_opportunity_subject(
+    db_session: Session, make_service: MakeFormationService
+) -> None:
+    """Mirrors `test_a_changed_estimate_supersedes_the_previous_active_memory`
+    but for the opportunity-scoped path: supersession pins the subject,
+    never re-resolving it (see the module docstring)."""
+    workspace = _workspace(db_session)
+    conversation = _conversation(db_session, workspace)
+    opportunity = _opportunity(db_session, workspace, conversation_id=conversation.id)
+    analysis = _completed_analysis(
+        db_session, workspace, conversation, fingerprint="fp-1", estimated_value_cents=150_000
+    )
+    service = make_service(workspace)
+    original = service.form_estimated_value_memory(conversation.id)
+    assert original is not None
+    assert original.opportunity_id == opportunity.id
+
+    analysis.input_fingerprint = "fp-2"
+    analysis.estimated_value_cents = 300_000
+    db_session.flush()
+
+    replacement = service.form_estimated_value_memory(conversation.id)
+
+    assert replacement is not None
+    assert replacement.id != original.id
+    assert replacement.opportunity_id == opportunity.id
+    assert replacement.contact_id is None
+
+
+# ---------------------------------------------------------------------------
 # B. Idempotency: calling again for the same completed analysis
 # ---------------------------------------------------------------------------
 
@@ -216,7 +421,8 @@ def test_calling_again_for_the_same_completed_analysis_does_not_duplicate(
     db_session: Session, make_service: MakeFormationService
 ) -> None:
     workspace = _workspace(db_session)
-    conversation = _conversation(db_session, workspace)
+    contact = _contact(db_session, workspace)
+    conversation = _conversation(db_session, workspace, contact_id=contact.id)
     _completed_analysis(db_session, workspace, conversation, fingerprint="fp-1")
     service = make_service(workspace)
     first = service.form_estimated_value_memory(conversation.id)
@@ -238,7 +444,8 @@ def test_a_changed_estimate_supersedes_the_previous_active_memory(
     db_session: Session, make_service: MakeFormationService
 ) -> None:
     workspace = _workspace(db_session)
-    conversation = _conversation(db_session, workspace)
+    contact = _contact(db_session, workspace)
+    conversation = _conversation(db_session, workspace, contact_id=contact.id)
     analysis = _completed_analysis(
         db_session, workspace, conversation, fingerprint="fp-1", estimated_value_cents=150_000
     )
@@ -258,6 +465,10 @@ def test_a_changed_estimate_supersedes_the_previous_active_memory(
     assert replacement.content["attributes"]["estimated_value_cents"] == 300_000
     assert original.status == MemoryStatus.SUPERSEDED
     assert original.superseded_by_id == replacement.id
+    # Subject is pinned across the supersession — never re-resolved (M6.4
+    # Block 3 correction: see the module docstring's "Subject resolution").
+    assert original.contact_id == contact.id
+    assert replacement.contact_id == contact.id
 
     active = MemoryRepository(db_session, workspace.id).get_active_for_analysis(
         analysis.id, kind=MemoryKind.FACT
@@ -269,7 +480,8 @@ def test_a_changed_currency_alone_also_supersedes(
     db_session: Session, make_service: MakeFormationService
 ) -> None:
     workspace = _workspace(db_session)
-    conversation = _conversation(db_session, workspace)
+    contact = _contact(db_session, workspace)
+    conversation = _conversation(db_session, workspace, contact_id=contact.id)
     analysis = _completed_analysis(
         db_session,
         workspace,
@@ -297,7 +509,8 @@ def test_a_chain_of_value_changes_leaves_exactly_one_active_memory(
     db_session: Session, make_service: MakeFormationService
 ) -> None:
     workspace = _workspace(db_session)
-    conversation = _conversation(db_session, workspace)
+    contact = _contact(db_session, workspace)
+    conversation = _conversation(db_session, workspace, contact_id=contact.id)
     analysis = _completed_analysis(
         db_session, workspace, conversation, fingerprint="fp-1", estimated_value_cents=100_000
     )
@@ -337,7 +550,8 @@ def test_a_later_analysis_with_no_valid_estimate_does_not_discard_the_existing_m
     db_session: Session, make_service: MakeFormationService
 ) -> None:
     workspace = _workspace(db_session)
-    conversation = _conversation(db_session, workspace)
+    contact = _contact(db_session, workspace)
+    conversation = _conversation(db_session, workspace, contact_id=contact.id)
     analysis = _completed_analysis(db_session, workspace, conversation, fingerprint="fp-1")
     service = make_service(workspace)
     original = service.form_estimated_value_memory(conversation.id)
@@ -504,7 +718,8 @@ def test_a_concurrent_external_resolution_of_the_active_memory_raises_invalid_st
     cost of a real thread/Barrier for a result that does not depend on actual
     parallel execution to be true."""
     workspace = _workspace(db_session)
-    conversation = _conversation(db_session, workspace)
+    contact = _contact(db_session, workspace)
+    conversation = _conversation(db_session, workspace, contact_id=contact.id)
     analysis = _completed_analysis(
         db_session, workspace, conversation, fingerprint="fp-1", estimated_value_cents=100_000
     )
@@ -559,7 +774,8 @@ def test_supersede_decision_passes_commit_false_to_both_remember_and_supersede(
     that call shape so a future edit that makes either inner call commit on
     its own, defeating the SAVEPOINT's atomicity, is caught immediately."""
     workspace = _workspace(db_session)
-    conversation = _conversation(db_session, workspace)
+    contact = _contact(db_session, workspace)
+    conversation = _conversation(db_session, workspace, contact_id=contact.id)
     analysis = _completed_analysis(
         db_session, workspace, conversation, fingerprint="fp-1", estimated_value_cents=100_000
     )
@@ -606,7 +822,8 @@ def test_a_failure_between_remember_and_supersede_leaves_nothing_committed(
     setup = _real_session(engine)
     workspace = _workspace(setup, "Atomicity")
     user = _user(setup)
-    conversation = _conversation(setup, workspace)
+    contact = _contact(setup, workspace)
+    conversation = _conversation(setup, workspace, contact_id=contact.id)
     analysis = _completed_analysis(
         setup, workspace, conversation, fingerprint="fp-1", estimated_value_cents=100_000
     )
@@ -692,8 +909,10 @@ def test_raises_not_found_for_a_conversation_outside_the_workspace(
 def test_is_isolated_by_workspace(db_session: Session, make_service: MakeFormationService) -> None:
     alice_workspace = _workspace(db_session, "Alice Co")
     bob_workspace = _workspace(db_session, "Bob Co")
-    alice_conversation = _conversation(db_session, alice_workspace)
-    bob_conversation = _conversation(db_session, bob_workspace)
+    alice_contact = _contact(db_session, alice_workspace)
+    bob_contact = _contact(db_session, bob_workspace)
+    alice_conversation = _conversation(db_session, alice_workspace, contact_id=alice_contact.id)
+    bob_conversation = _conversation(db_session, bob_workspace, contact_id=bob_contact.id)
     _completed_analysis(db_session, alice_workspace, alice_conversation, fingerprint="fp-alice")
     _completed_analysis(db_session, bob_workspace, bob_conversation, fingerprint="fp-bob")
 
@@ -712,7 +931,8 @@ def test_records_an_activity_event_attributed_to_nerva_on_create(
     db_session: Session, make_service: MakeFormationService
 ) -> None:
     workspace = _workspace(db_session)
-    conversation = _conversation(db_session, workspace)
+    contact = _contact(db_session, workspace)
+    conversation = _conversation(db_session, workspace, contact_id=contact.id)
     _completed_analysis(db_session, workspace, conversation)
     service = make_service(workspace)
 
@@ -731,7 +951,8 @@ def test_records_activity_events_attributed_to_nerva_on_supersede(
     db_session: Session, make_service: MakeFormationService
 ) -> None:
     workspace = _workspace(db_session)
-    conversation = _conversation(db_session, workspace)
+    contact = _contact(db_session, workspace)
+    conversation = _conversation(db_session, workspace, contact_id=contact.id)
     analysis = _completed_analysis(db_session, workspace, conversation, fingerprint="fp-1")
     service = make_service(workspace)
     original = service.form_estimated_value_memory(conversation.id)
@@ -789,7 +1010,8 @@ def test_two_concurrent_calls_for_the_same_fingerprint_never_duplicate(engine: E
     setup = _real_session(engine)
     workspace = _workspace(setup, "Concurrency Same FP")
     user = _user(setup)
-    conversation = _conversation(setup, workspace)
+    contact = _contact(setup, workspace)
+    conversation = _conversation(setup, workspace, contact_id=contact.id)
     analysis = _completed_analysis(
         setup, workspace, conversation, fingerprint="fp-1", estimated_value_cents=150_000
     )
@@ -852,7 +1074,8 @@ def test_two_different_fingerprints_racing_never_leave_two_active_or_a_stale_win
     setup = _real_session(engine)
     workspace = _workspace(setup, "Concurrency Diff FP")
     user = _user(setup)
-    conversation = _conversation(setup, workspace)
+    contact = _contact(setup, workspace)
+    conversation = _conversation(setup, workspace, contact_id=contact.id)
     analysis = _completed_analysis(
         setup, workspace, conversation, fingerprint="fp-start", estimated_value_cents=1_000
     )

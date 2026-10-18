@@ -167,6 +167,39 @@ def test_analyzing_a_conversation_returns_the_completed_result(
     assert ai_client.call_count == 1
 
 
+def test_the_memory_audit_snapshot_is_never_exposed_in_the_api_response(
+    client: TestClient,
+    db_session: Session,
+    make_user: MakeUser,
+    make_workspace: MakeWorkspace,
+    ai_client: FakeAIClient,
+) -> None:
+    """M6.4 Block 4: `ConversationAnalysis.memory_ids_used` is internal audit
+    data only. `ConversationAnalysisRead` (`schemas/crm.py`) does not declare
+    it, so Pydantic's `from_attributes` never serializes it — confirmed here
+    against the real HTTP response, not just by reading the schema."""
+    owner = make_user("Alice")
+    workspace_id = make_workspace(owner)
+    contact_id = _contact(db_session, workspace_id)
+    conversation_id = _conversation(db_session, workspace_id, contact_id=contact_id)
+    _message(db_session, conversation_id, workspace_id)
+    ai_client.next_result = make_analysis_result(confidence=0.9)
+
+    response = client.post(
+        f"/v1/workspaces/{workspace_id}/conversations/{conversation_id}/analyze",
+        cookies=owner.cookies,
+    )
+
+    assert response.status_code == 200, response.text
+    assert "memory_ids_used" not in response.json()
+
+    detail = client.get(
+        f"/v1/workspaces/{workspace_id}/conversations/{conversation_id}",
+        cookies=owner.cookies,
+    ).json()
+    assert "memory_ids_used" not in detail["analysis"]
+
+
 def test_a_non_owner_member_can_also_trigger_analysis(
     client: TestClient,
     db_session: Session,
@@ -481,7 +514,8 @@ def test_analyzing_with_an_explicit_estimate_forms_a_fact_memory(
 ) -> None:
     owner = make_user("Alice")
     workspace_id = make_workspace(owner)
-    conversation_id = _conversation(db_session, workspace_id)
+    contact_id = _contact(db_session, workspace_id)
+    conversation_id = _conversation(db_session, workspace_id, contact_id=contact_id)
     _message(db_session, conversation_id, workspace_id)
     ai_client.next_result = make_analysis_result(
         commercial_signal=True,
@@ -507,6 +541,7 @@ def test_analyzing_with_an_explicit_estimate_forms_a_fact_memory(
     assert memory["source_analysis_id"] == analysis_id
     assert memory["source_fingerprint"] is not None
     assert memory["attributes"] == {"estimated_value_cents": 150_000, "value_currency": "USD"}
+    assert memory["contact_id"] == contact_id  # fallback subject: no opportunity linked
 
 
 def test_forcing_reanalysis_with_a_changed_estimate_supersedes_without_two_active_memories(
@@ -518,7 +553,8 @@ def test_forcing_reanalysis_with_a_changed_estimate_supersedes_without_two_activ
 ) -> None:
     owner = make_user("Alice")
     workspace_id = make_workspace(owner)
-    conversation_id = _conversation(db_session, workspace_id)
+    contact_id = _contact(db_session, workspace_id)
+    conversation_id = _conversation(db_session, workspace_id, contact_id=contact_id)
     _message(db_session, conversation_id, workspace_id)
     url = f"/v1/workspaces/{workspace_id}/conversations/{conversation_id}/analyze"
     ai_client.next_result = make_analysis_result(
@@ -614,9 +650,28 @@ def test_a_cache_hit_reanalysis_does_not_duplicate_the_memory(
     make_workspace: MakeWorkspace,
     ai_client: FakeAIClient,
 ) -> None:
+    """M6.4 Block 3 note: the *second* call here is no longer a cache hit.
+    `AnalysisService.analyze` now folds the conversation's own active memory
+    into `AnalysisInput.memory_context` (see `nerva.services.analysis`'s
+    module docstring, "memory as analysis context"), and that memory does
+    not exist yet when the *first* call computes its fingerprint — only
+    after it completes does `MemoryFormationService` create it. The second
+    call therefore sees a genuinely different input (now with one memory in
+    context) and correctly re-analyzes once, exactly as a changed `schema_
+    version`/`prompt_version`/`model_id` already would. This is a one-time,
+    self-stabilizing effect, not a loop: a *third* call sees the exact same
+    memory context as the second (M6.3 leaves the value unchanged, so no new
+    memory forms), and is a true cache hit. This single test now covers both
+    this block's own idempotency claim (never two memory rows for one fact)
+    and M6.4 Block 3's explicit "no immediate auto-invalidation loop"
+    requirement. Uses a conversation with a contact — since M6.4 Block 3's
+    subject-resolution correction, `MemoryFormationService` never forms a
+    memory at all without one (see `nerva.services.memory_formation`'s
+    module docstring, "Subject resolution")."""
     owner = make_user("Alice")
     workspace_id = make_workspace(owner)
-    conversation_id = _conversation(db_session, workspace_id)
+    contact_id = _contact(db_session, workspace_id)
+    conversation_id = _conversation(db_session, workspace_id, contact_id=contact_id)
     _message(db_session, conversation_id, workspace_id)
     ai_client.next_result = make_analysis_result(
         confidence=0.9,
@@ -627,21 +682,32 @@ def test_a_cache_hit_reanalysis_does_not_duplicate_the_memory(
     first = client.post(url, cookies=owner.cookies)
     first_memory_id = _memories(client, workspace_id, owner)[0]["id"]
     second = client.post(url, cookies=owner.cookies)
+    third = client.post(url, cookies=owner.cookies)
 
-    assert first.status_code == second.status_code == 200
-    assert ai_client.call_count == 1  # the cache hit never calls the provider again
+    assert first.status_code == second.status_code == third.status_code == 200
+    # One extra provider call when the memory first becomes part of the
+    # context (second call), then it stabilizes (third call is a true cache
+    # hit) — never an unbounded, ever-growing loop of re-analysis.
+    assert ai_client.call_count == 2
     memories = _memories(client, workspace_id, owner)
     assert len(memories) == 1
     assert memories[0]["id"] == first_memory_id
 
 
-def test_a_conversation_without_a_contact_forms_a_workspace_level_memory(
+def test_a_conversation_without_a_contact_or_opportunity_forms_no_memory(
     client: TestClient,
     db_session: Session,
     make_user: MakeUser,
     make_workspace: MakeWorkspace,
     ai_client: FakeAIClient,
 ) -> None:
+    """M6.4 Block 3 correction: a conversation with no contact and no
+    unambiguous `Opportunity` never forms an `estimated_value` memory at all
+    — it is never silently promoted to a WORKSPACE-level memory just because
+    entity resolution failed. See `nerva.services.memory_formation`'s module
+    docstring, "Subject resolution". This replaces the previous version of
+    this test, which asserted the opposite (a WORKSPACE-level memory was
+    formed) — that was the bug this correction fixes."""
     owner = make_user("Alice")
     workspace_id = make_workspace(owner)
     conversation_id = _conversation(db_session, workspace_id)  # no contact_id
@@ -657,11 +723,8 @@ def test_a_conversation_without_a_contact_forms_a_workspace_level_memory(
     )
 
     assert response.status_code == 200, response.text
-    memories = _memories(client, workspace_id, owner)
-    assert len(memories) == 1
-    assert memories[0]["contact_id"] is None
-    assert memories[0]["company_id"] is None
-    assert memories[0]["opportunity_id"] is None
+    assert response.json()["status"] == "completed"  # analysis itself still succeeds
+    assert _memories(client, workspace_id, owner) == []
 
 
 def test_a_conversation_with_a_known_contact_attaches_the_memory_to_it(
@@ -702,9 +765,11 @@ def test_memory_formation_is_isolated_between_workspaces(
     alice, bob = make_user("Alice"), make_user("Bob")
     alice_workspace = make_workspace(alice, "Alice Co")
     bob_workspace = make_workspace(bob, "Bob Co")
-    alice_conversation = _conversation(db_session, alice_workspace)
+    alice_contact = _contact(db_session, alice_workspace)
+    bob_contact = _contact(db_session, bob_workspace)
+    alice_conversation = _conversation(db_session, alice_workspace, contact_id=alice_contact)
     _message(db_session, alice_conversation, alice_workspace)
-    bob_conversation = _conversation(db_session, bob_workspace)
+    bob_conversation = _conversation(db_session, bob_workspace, contact_id=bob_contact)
     _message(db_session, bob_conversation, bob_workspace)
     ai_client.next_result = make_analysis_result(
         confidence=0.9,
@@ -741,7 +806,8 @@ def test_a_memory_formation_failure_during_individual_analysis_is_not_a_misleadi
     failure is never silently reported as success."""
     owner = make_user("Alice")
     workspace_id = make_workspace(owner)
-    conversation_id = _conversation(db_session, workspace_id)
+    contact_id = _contact(db_session, workspace_id)
+    conversation_id = _conversation(db_session, workspace_id, contact_id=contact_id)
     _message(db_session, conversation_id, workspace_id)
     ai_client.next_result = make_analysis_result(
         confidence=0.9,
@@ -771,7 +837,10 @@ def test_backfill_forms_memories_for_conversations_with_valid_estimates(
 ) -> None:
     owner = make_user("Alice")
     workspace_id = make_workspace(owner)
-    with_estimate = _conversation(db_session, workspace_id, subject="Has an estimate")
+    with_estimate_contact = _contact(db_session, workspace_id)
+    with_estimate = _conversation(
+        db_session, workspace_id, subject="Has an estimate", contact_id=with_estimate_contact
+    )
     _message(db_session, with_estimate, workspace_id, body_text="estimate conversation")
     without_estimate = _conversation(db_session, workspace_id, subject="No estimate")
     _message(
@@ -826,7 +895,10 @@ def test_a_memory_formation_failure_in_the_backfill_does_not_abort_the_batch(
     workspace_id = make_workspace(owner)
     conversation_ids = []
     for i in range(3):
-        conversation_id = _conversation(db_session, workspace_id, subject=f"Conversation {i}")
+        contact_id = _contact(db_session, workspace_id, email=f"contact-{i}@halcyon.example")
+        conversation_id = _conversation(
+            db_session, workspace_id, subject=f"Conversation {i}", contact_id=contact_id
+        )
         _message(
             db_session,
             conversation_id,
