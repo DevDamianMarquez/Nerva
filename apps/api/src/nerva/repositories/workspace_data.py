@@ -490,6 +490,21 @@ class ActionRepository(ScopedRepository[Action]):
             statement = statement.where(Action.status == status)
         return self._page(statement, limit=limit, offset=offset)
 
+    def get_by_proposal_fingerprint(self, proposal_fingerprint: str) -> Action | None:
+        """The automatic proposal with this exact identity in this workspace,
+        if one exists — used by `services.proposal_materialization.
+        ProposalMaterializationService` *after* an insert attempt's unique
+        violation has already been rolled back to a savepoint (M7.1c), to
+        hand the caller the existing row rather than just "it already
+        exists." At most one row can ever match: `Action`'s partial unique
+        index on `(workspace_id, proposal_fingerprint)` (see
+        `nerva.models.actions.PROPOSAL_FINGERPRINT_UNIQUE_INDEX`) guarantees
+        it at the database level — this method does not re-derive or assume
+        that guarantee, it relies on it."""
+        return self.session.scalars(
+            self._select().where(Action.proposal_fingerprint == proposal_fingerprint)
+        ).one_or_none()
+
 
 class ActivityEventRepository(ScopedRepository[ActivityEvent]):
     """Append-only: exposes `add` and reads, and no way to update or delete."""

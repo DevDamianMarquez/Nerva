@@ -26,3 +26,29 @@ def test_ai_provider_is_not_configured_without_an_api_key() -> None:
 
 def test_ai_provider_is_configured_once_an_api_key_is_set() -> None:
     assert Settings(openai_api_key="sk-test").ai_provider_configured is True
+
+
+def test_groq_provider_is_not_configured_without_a_key_and_a_model() -> None:
+    neither = Settings(groq_api_key="", nerva_groq_agent_reasoning_model="")
+    key_only = Settings(groq_api_key="gsk-test", nerva_groq_agent_reasoning_model="")
+    model_only = Settings(groq_api_key="", nerva_groq_agent_reasoning_model="openai/gpt-oss-120b")
+
+    assert neither.groq_provider_configured is False
+    assert key_only.groq_provider_configured is False
+    assert model_only.groq_provider_configured is False
+
+
+def test_groq_provider_is_configured_once_both_a_key_and_a_model_are_set() -> None:
+    settings = Settings(
+        groq_api_key="gsk-test", nerva_groq_agent_reasoning_model="openai/gpt-oss-120b"
+    )
+
+    assert settings.groq_provider_configured is True
+
+
+def test_groq_agent_reasoning_model_has_no_fallback_to_the_openai_model() -> None:
+    """Unlike `agent_reasoning_model`, a blank Groq model stays blank — there
+    is no OpenAI model id this property could sensibly fall back to."""
+    settings = Settings(nerva_groq_agent_reasoning_model="", nerva_ai_model="gpt-4o-mini")
+
+    assert settings.groq_agent_reasoning_model == ""

@@ -1,4 +1,5 @@
-"""The default `AIAnalysisClient` until a real provider is configured (Block 7).
+"""The default `AIAnalysisClient`/`AgentReasoningClient` until a real provider
+is configured.
 
 Every call fails safely and explicitly rather than silently returning a fake
 or best-guess result — the same discipline `GoogleOAuthClient.build_authorization_url`
@@ -9,6 +10,7 @@ compute the idempotency fingerprint *before* deciding whether to call
 configured is still served without ever needing this client to succeed.
 """
 
+from nerva.nerva_ai.agent_client import AgentReasoningInput, AgentReasoningOutcome
 from nerva.nerva_ai.client import AnalysisInput, AnalysisOutcome
 from nerva.nerva_ai.errors import AIAuthError
 
@@ -25,3 +27,17 @@ class UnconfiguredAIClient:
 
     def analyze(self, request: AnalysisInput) -> AnalysisOutcome:
         raise AIAuthError("AI analysis is not configured on this server.")
+
+
+class UnconfiguredAgentReasoningClient:
+    """Structurally implements `AgentReasoningClient` (M7.1e). Mirrors
+    `UnconfiguredAIClient` exactly: every `reason()` call raises `AIAuthError`
+    rather than faking a decision — a workspace with no OpenAI credentials
+    configured gets an honest, typed failure, never a silent `NoActionDecision`
+    that could be mistaken for a real "nothing to do" read."""
+
+    provider = "none"
+    model_id = "unconfigured"
+
+    def reason(self, request: AgentReasoningInput) -> AgentReasoningOutcome:
+        raise AIAuthError("Agent reasoning is not configured on this server.")

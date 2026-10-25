@@ -29,7 +29,39 @@ class ActionService(ScopedService):
     def _repo(self) -> ActionRepository:
         return ActionRepository(self.session, self.ctx.workspace_id)
 
-    def propose(self, data: ActionCreate, *, actor: Actor | None = None) -> Action:
+    def propose(
+        self,
+        data: ActionCreate,
+        *,
+        actor: Actor | None = None,
+        proposal_fingerprint: str | None = None,
+        provenance: dict[str, Any] | None = None,
+        commit: bool = True,
+    ) -> Action:
+        """`proposal_fingerprint`/`provenance`/`commit` exist for M7.1c's
+        `ProposalMaterializationService` and default to exactly the prior
+        behavior for every existing caller (a human, via `POST /actions`,
+        which never passes any of the three): `proposal_fingerprint=None`
+        (a human-proposed action never has one — see `nerva.models.
+        actions.Action`'s own docstring), `provenance=None` (the
+        `ACTION_PROPOSED` event's `data` stays exactly `{"action_type":
+        ...}`, unchanged), `commit=True` (commits immediately, as before).
+
+        `provenance`, when given, is merged into the *same* `ACTION_PROPOSED`
+        `ActivityEvent` this method already writes — never a second event —
+        so an automatic proposal's reasoning-state identity is auditable
+        without any new event type or a second write. Internal ids are
+        expected and correct inside `provenance` (e.g. `conversation_id`,
+        `analysis_id`): the "no internal ids" rule is about what an LLM is
+        ever shown, not about this workspace's own audit trail — see
+        `nerva.services.proposal_materialization`'s module docstring.
+
+        `commit=False` lets a caller (again, only `ProposalMaterializationService`
+        today) wrap this call in its own `Session.begin_nested()` SAVEPOINT,
+        so a unique-constraint violation on `proposal_fingerprint` can be
+        rolled back to that savepoint alone — never the caller's whole
+        transaction — the same reasoning `MemoryService.replace` already
+        documents for its own `commit=False` composition."""
         actor = actor or self.ctx.actor
         self._require_opportunity(data.opportunity_id)
         action = self._repo.add(
@@ -39,19 +71,24 @@ class ActionService(ScopedService):
                 summary=data.summary,
                 payload=dict(data.payload),
                 opportunity_id=data.opportunity_id,
+                proposal_fingerprint=proposal_fingerprint,
                 created_by_type=actor.type,
                 created_by_user_id=actor.user_id,
             )
         )
+        event_data: dict[str, Any] = {"action_type": action.type}
+        if provenance:
+            event_data.update(provenance)
         self.activity.record(
             actor=actor,
             event_type=ActivityEventType.ACTION_PROPOSED,
             entity_type="action",
             entity_id=action.id,
             summary=f"Proposed: {action.summary}",
-            data={"action_type": action.type},
+            data=event_data,
         )
-        self.session.commit()
+        if commit:
+            self.session.commit()
         return action
 
     def get(self, action_id: uuid.UUID) -> Action:

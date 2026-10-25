@@ -9,6 +9,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # apps/api/src/nerva/core/config.py -> repository root
 REPO_ROOT = Path(__file__).resolve().parents[5]
 
+AgentReasoningProvider = Literal["openai", "groq"]
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -40,6 +42,56 @@ class Settings(BaseSettings):
     # `nerva.api.deps.get_ai_client`) rather than with a fake or best-guess result.
     openai_api_key: str = ""
     nerva_ai_model: str = "gpt-4o-mini"
+    # --- Nerva AI: agent reasoning (M7.1e) -----------------------------------------
+    # Same OpenAI account as analysis (`openai_api_key`/`ai_provider_configured`
+    # above) — reasoning does not need a second API key. The model itself is
+    # intentionally a *separate* knob from `nerva_ai_model`: proposing an action is
+    # a different, higher-stakes decision than classifying a conversation, so the
+    # two pipelines should be free to use different models later without an
+    # architecture change today. Left blank by default — see
+    # `agent_reasoning_model` for the fallback this enables.
+    nerva_agent_reasoning_model: str = ""
+    # --- Nerva AI: agent reasoning provider selection (M7.1g) ----------------------
+    # Explicit, fail-closed selection between the two real `AgentReasoningClient`
+    # implementations. Defaults to "openai" so an environment with no new variables
+    # set at all keeps the exact behavior M7.1e already shipped — adding Groq support
+    # must never silently change what an already-deployed workspace does. An
+    # unrecognized value (a typo) fails `Settings()` construction itself, at
+    # application startup, via this `Literal` — never a runtime "unconfigured"
+    # fallback for a misspelled provider name (see `nerva.api.deps.
+    # get_agent_reasoning_client` for why no cross-provider fallback ever exists
+    # either).
+    nerva_agent_reasoning_provider: AgentReasoningProvider = "openai"
+    # Blank until configured; a second, independent API key — Groq is a different
+    # account/vendor from OpenAI, unlike `nerva_agent_reasoning_model`'s relationship
+    # to `openai_api_key` above.
+    groq_api_key: str = ""
+    # Deliberately no fallback to `nerva_ai_model`/`agent_reasoning_model`: those name
+    # OpenAI model ids, which are not valid Groq model ids. There is no safe default
+    # to guess here — see `groq_agent_reasoning_model`'s own docstring for the
+    # fail-closed consequence of leaving this blank.
+    nerva_groq_agent_reasoning_model: str = ""
+
+    @property
+    def agent_reasoning_model(self) -> str:
+        """The model `OpenAIAgentReasoningProvider` calls. Falls back to
+        `nerva_ai_model` when `nerva_agent_reasoning_model` is unset, so a
+        single configured model works for both pipelines until someone
+        deliberately points reasoning at a different one — never a silent,
+        separate default that could drift from what an operator thinks is
+        configured."""
+        return self.nerva_agent_reasoning_model or self.nerva_ai_model
+
+    @property
+    def groq_agent_reasoning_model(self) -> str:
+        """The model `GroqAgentReasoningProvider` calls — `""` (falsy) if
+        unset. Unlike `agent_reasoning_model`, there is no fallback: a Groq
+        model id is never interchangeable with an OpenAI one, so guessing one
+        would be inventing configuration, not defaulting it. `groq_
+        provider_configured` is what actually gates whether Groq is usable;
+        this property is read only after that gate already passed (see
+        `nerva.api.deps.get_agent_reasoning_client`)."""
+        return self.nerva_groq_agent_reasoning_model
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -61,6 +113,16 @@ class Settings(BaseSettings):
     @property
     def ai_provider_configured(self) -> bool:
         return bool(self.openai_api_key)
+
+    @property
+    def groq_provider_configured(self) -> bool:
+        """True only if *both* a Groq API key and an explicit Groq reasoning
+        model are set. Unlike `ai_provider_configured` (a key alone, because
+        `agent_reasoning_model` always has a usable fallback), Groq has no
+        fallback model to guess — so "usable" requires both, not just the
+        key, or `get_agent_reasoning_client` would otherwise build a
+        provider pointed at an empty model id."""
+        return bool(self.groq_api_key and self.nerva_groq_agent_reasoning_model)
 
 
 @lru_cache

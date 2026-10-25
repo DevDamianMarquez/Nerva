@@ -29,6 +29,11 @@ dependencies = [
     # never imported outside that one module. Structured Outputs (response_format=
     # a Pydantic model) needs a reasonably current SDK.
     "openai>=1.54",
+    # Nerva AI: the real Groq-backed AgentReasoningClient
+    # (nerva_ai/providers/groq_agent_reasoning.py) only — never imported outside
+    # that one module. M7.1g.1's audit confirmed the official SDK (not the OpenAI
+    # SDK against Groq's OpenAI-compatible endpoint) is the right choice here.
+    "groq>=1.7,<2",
 ]
 
 [project.optional-dependencies]
