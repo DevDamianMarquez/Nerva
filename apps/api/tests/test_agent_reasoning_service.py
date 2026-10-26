@@ -1593,17 +1593,22 @@ def test_the_orchestration_module_never_imports_a_provider_prompt_or_transport()
         assert not offenders, f"{source_path.name} imports {offenders}"
 
 
-def test_no_http_route_exposes_the_reasoning_loop() -> None:
-    """M7.1d is service-only on purpose (see the module docstring's "Explicit
-    invocation only"): no route module may import it yet."""
+def test_exactly_one_http_route_exposes_the_reasoning_loop() -> None:
+    """M7.1d was service-only on purpose (see the module docstring's
+    "Explicit invocation only"); M8.1 is the "later block" that docstring
+    anticipated, wiring exactly one explicit, human-triggered route
+    (`routes.conversations.reason_about_conversation`) to it. This guards the
+    boundary from widening by accident: reasoning must not also get wired
+    into some *other* route module (e.g. analysis, Gmail sync) without that
+    being a deliberate, reviewed decision."""
     routes_dir = Path(agent_reasoning_module.__file__).parent.parent / "routes"
-    offenders = [
+    importers = [
         path.name
         for path in routes_dir.glob("*.py")
         if "agent_reasoning" in path.read_text(encoding="utf-8")
     ]
 
-    assert offenders == []
+    assert importers == ["conversations.py"]
 
 
 def test_the_analysis_pipeline_does_not_trigger_reasoning_automatically() -> None:

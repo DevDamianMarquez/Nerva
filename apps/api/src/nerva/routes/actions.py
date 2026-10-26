@@ -53,9 +53,22 @@ def list_actions(
     status_filter: Annotated[
         ActionStatus | None, Query(alias="status", description="Only actions in this status.")
     ] = None,
+    conversation_id: Annotated[
+        uuid.UUID | None,
+        Query(description="Only actions reasoned from this conversation."),
+    ] = None,
 ) -> list[ActionRead]:
+    """`conversation_id` composes with `status` (both narrow the same `AND`
+    filter). An unknown or cross-workspace `conversation_id` is not an error:
+    it is a plain equality filter on an already workspace-scoped column, so
+    it simply yields an empty list — it never reveals whether a conversation
+    exists in another tenant (see `nerva.repositories.base.ScopedRepository`).
+    """
     actions = ActionService(session, ctx).list(
-        status=status_filter, limit=page.limit, offset=page.offset
+        status=status_filter,
+        conversation_id=conversation_id,
+        limit=page.limit,
+        offset=page.offset,
     )
     return [ActionRead.model_validate(action) for action in actions]
 

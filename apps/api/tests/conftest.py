@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 import nerva.models  # noqa: F401  (registers tables on Base.metadata)
 from nerva.api.deps import (
+    get_agent_reasoning_client,
     get_ai_client,
     get_gmail_client,
     get_gmail_sender,
@@ -28,6 +29,7 @@ from nerva.core.config import Settings, get_settings
 from nerva.core.security import SESSION_COOKIE_NAME
 from nerva.db.base import Base
 from nerva.db.session import get_session
+from tests.fakes.agent_reasoning import FakeAgentReasoningClient
 from tests.fakes.ai import FakeAIClient
 from tests.fakes.google import FakeGmailClient, FakeGmailSender, FakeGoogleOAuthClient
 from tests.helpers import Account, ensure_database
@@ -101,12 +103,22 @@ def ai_client() -> FakeAIClient:
 
 
 @pytest.fixture
+def agent_reasoning_client() -> FakeAgentReasoningClient:
+    """Stands in for the agent-reasoning provider boundary (M8.1). Set
+    `.next_decision` / `.fail_with` in a test to script a specific scenario.
+    No test using this fixture ever reaches `UnconfiguredAgentReasoningClient`,
+    Groq, or OpenAI — see `tests/fakes/agent_reasoning.py`."""
+    return FakeAgentReasoningClient()
+
+
+@pytest.fixture
 def client(
     db_session: Session,
     google_oauth_client: FakeGoogleOAuthClient,
     gmail_client: FakeGmailClient,
     gmail_sender: FakeGmailSender,
     ai_client: FakeAIClient,
+    agent_reasoning_client: FakeAgentReasoningClient,
 ) -> Iterator[TestClient]:
     app = create_app(Settings(environment="test"))
 
@@ -121,6 +133,7 @@ def client(
     app.dependency_overrides[get_gmail_client] = lambda: gmail_client
     app.dependency_overrides[get_gmail_sender] = lambda: gmail_sender
     app.dependency_overrides[get_ai_client] = lambda: ai_client
+    app.dependency_overrides[get_agent_reasoning_client] = lambda: agent_reasoning_client
     with TestClient(app) as test_client:
         yield test_client
 

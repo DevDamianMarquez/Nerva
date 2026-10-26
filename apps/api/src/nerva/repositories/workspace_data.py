@@ -483,11 +483,18 @@ class ActionRepository(ScopedRepository[Action]):
         ).one_or_none()
 
     def list_filtered(
-        self, *, status: ActionStatus | None, limit: int, offset: int
+        self,
+        *,
+        status: ActionStatus | None,
+        conversation_id: uuid.UUID | None = None,
+        limit: int,
+        offset: int,
     ) -> Sequence[Action]:
         statement = self._select()
         if status is not None:
             statement = statement.where(Action.status == status)
+        if conversation_id is not None:
+            statement = statement.where(Action.conversation_id == conversation_id)
         return self._page(statement, limit=limit, offset=offset)
 
     def get_by_proposal_fingerprint(self, proposal_fingerprint: str) -> Action | None:

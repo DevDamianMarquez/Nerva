@@ -158,6 +158,10 @@ class ProposalMaterializationService(ScopedService):
                 actor=Actor.nerva(),
                 proposal_fingerprint=fingerprint,
                 provenance=event_data,
+                # The only authoritative source (M8.1) — never a second,
+                # independently-suppliable `conversation_id` parameter on this
+                # method. See the module docstring's "Provenance".
+                conversation_id=provenance.conversation_id,
                 commit=False,
             )
             nested.commit()

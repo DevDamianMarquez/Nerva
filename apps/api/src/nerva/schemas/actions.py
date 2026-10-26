@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, JsonValue, StringConstraints
 
@@ -25,6 +25,7 @@ class ActionRead(ResponseModel):
     id: uuid.UUID
     workspace_id: uuid.UUID
     opportunity_id: uuid.UUID | None
+    conversation_id: uuid.UUID | None
     type: str
     status: ActionStatus
     summary: str
@@ -41,6 +42,21 @@ class ActionRead(ResponseModel):
     finished_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+
+class ReasonConversationRead(ResponseModel):
+    """The response of `POST .../conversations/{id}/reason` (M8.1). Maps
+    directly from `nerva.services.agent_reasoning.AgentReasoningResult` —
+    deliberately narrower than that dataclass: no `reasoning_fingerprint`,
+    `provider`, or `model_id` (internal/observability only, never a client
+    concern), no raw provider output, no prompt, no memory context. `detail`
+    is `decide_proposal`'s own fixed, codebase-authored explanation text
+    (see `AgentReasoningResult.policy_detail`'s docstring) — never
+    model-authored or provider-supplied prose."""
+
+    outcome: Literal["no_action", "policy_rejected", "action_created", "action_duplicate"]
+    action: ActionRead | None
+    detail: str | None
 
 
 class ActivityEventRead(ResponseModel):

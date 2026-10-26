@@ -47,8 +47,26 @@ class Action(WorkspaceOwnedModel, UpdatedAtMixin, CreatedByMixin):
     __tablename__ = "actions"
     __table_args__ = (
         Index("ix_actions_workspace_id_status_created_at", "workspace_id", "status", "created_at"),
+        Index(
+            "ix_actions_workspace_id_conversation_id_created_at",
+            "workspace_id",
+            "conversation_id",
+            "created_at",
+        ),
         actor_consistency_check("created_by_type", "created_by_user_id"),
         tenant_fk("opportunity_id", "opportunities"),
+        # NULL for every human-proposed action (`POST /actions`) and for any
+        # automatic action type with no conversation to attribute to; set only
+        # by `ProposalMaterializationService`, from `ProposalProvenance.
+        # conversation_id` (M8.1) — see that module's own docstring.
+        # `SET NULL (conversation_id)` (PostgreSQL 15+ column-specific syntax,
+        # the same precedent `Memory.source_conversation_id` already uses)
+        # rather than a plain `SET NULL`, which would null the whole composite
+        # including `workspace_id` — NOT NULL here, which would make the
+        # conversation's delete fail instead of succeeding. Not `CASCADE`: an
+        # `Action` is an approval/audit record that must outlive the
+        # conversation it was reasoned from.
+        tenant_fk("conversation_id", "conversations", ondelete="SET NULL (conversation_id)"),
         # Multiple NULLs coexist freely (every human-proposed action); among
         # non-NULL values, unique per workspace — the same fingerprint may
         # recur in a *different* workspace without conflict, since
@@ -63,6 +81,12 @@ class Action(WorkspaceOwnedModel, UpdatedAtMixin, CreatedByMixin):
     )
 
     opportunity_id: Mapped[uuid.UUID | None]
+    # The conversation an automatic proposal was reasoned from. NULL for every
+    # human-proposed action and for any automatic action type that is not
+    # conversation-sourced. The only writer is `ProposalMaterializationService`,
+    # from `ProposalProvenance.conversation_id` — never settable from
+    # `ActionCreate` or any other caller-supplied input (M8.1).
+    conversation_id: Mapped[uuid.UUID | None]
     # Free text (validated against `ActionType` at the API) so new types need no migration.
     type: Mapped[str] = mapped_column(String(64))
     status: Mapped[ActionStatus] = mapped_column(

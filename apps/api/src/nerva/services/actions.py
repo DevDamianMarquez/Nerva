@@ -36,16 +36,27 @@ class ActionService(ScopedService):
         actor: Actor | None = None,
         proposal_fingerprint: str | None = None,
         provenance: dict[str, Any] | None = None,
+        conversation_id: uuid.UUID | None = None,
         commit: bool = True,
     ) -> Action:
-        """`proposal_fingerprint`/`provenance`/`commit` exist for M7.1c's
-        `ProposalMaterializationService` and default to exactly the prior
-        behavior for every existing caller (a human, via `POST /actions`,
-        which never passes any of the three): `proposal_fingerprint=None`
-        (a human-proposed action never has one — see `nerva.models.
-        actions.Action`'s own docstring), `provenance=None` (the
-        `ACTION_PROPOSED` event's `data` stays exactly `{"action_type":
-        ...}`, unchanged), `commit=True` (commits immediately, as before).
+        """`proposal_fingerprint`/`provenance`/`conversation_id`/`commit` exist
+        for M7.1c/M8.1's `ProposalMaterializationService` and default to
+        exactly the prior behavior for every existing caller (a human, via
+        `POST /actions`, which never passes any of the four):
+        `proposal_fingerprint=None` (a human-proposed action never has one —
+        see `nerva.models.actions.Action`'s own docstring), `provenance=None`
+        (the `ACTION_PROPOSED` event's `data` stays exactly `{"action_type":
+        ...}`, unchanged), `conversation_id=None` (a human-proposed action
+        never has one either — see `Action.conversation_id`'s own docstring;
+        `ActionCreate`, the human-facing request schema, has no field for it,
+        so there is no way for a client to supply one), `commit=True`
+        (commits immediately, as before).
+
+        `conversation_id` must only ever be the caller's own
+        `ProposalProvenance.conversation_id` (M8.1) — never re-derived from
+        `provenance` (a plain, uninspected `dict` here) and never a second,
+        independently-suppliable source of the same fact. See
+        `nerva.services.proposal_materialization`'s module docstring.
 
         `provenance`, when given, is merged into the *same* `ACTION_PROPOSED`
         `ActivityEvent` this method already writes — never a second event —
@@ -72,6 +83,7 @@ class ActionService(ScopedService):
                 payload=dict(data.payload),
                 opportunity_id=data.opportunity_id,
                 proposal_fingerprint=proposal_fingerprint,
+                conversation_id=conversation_id,
                 created_by_type=actor.type,
                 created_by_user_id=actor.user_id,
             )
@@ -97,8 +109,17 @@ class ActionService(ScopedService):
             raise NotFoundError("Action not found.")
         return action
 
-    def list(self, *, status: ActionStatus | None, limit: int, offset: int) -> Sequence[Action]:
-        return self._repo.list_filtered(status=status, limit=limit, offset=offset)
+    def list(
+        self,
+        *,
+        status: ActionStatus | None,
+        conversation_id: uuid.UUID | None = None,
+        limit: int,
+        offset: int,
+    ) -> Sequence[Action]:
+        return self._repo.list_filtered(
+            status=status, conversation_id=conversation_id, limit=limit, offset=offset
+        )
 
     def approve(self, action_id: uuid.UUID) -> Action:
         def apply(action: Action) -> None:
