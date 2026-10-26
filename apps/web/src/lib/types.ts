@@ -81,6 +81,19 @@ export interface Action {
   updated_at: string;
 }
 
+export type ReasonOutcome = "no_action" | "policy_rejected" | "action_created" | "action_duplicate";
+
+/** The response of `POST .../conversations/{id}/reason`. Deliberately
+ * narrower than the backend's internal reasoning result: no provider, model,
+ * prompt, fingerprint, memory ids, or policy-reason code ever reach the
+ * frontend — `detail` is the backend's own fixed, safe explanation text
+ * only, never raw/model-authored output. */
+export interface ReasonConversationRead {
+  outcome: ReasonOutcome;
+  action: Action | null;
+  detail: string | null;
+}
+
 export interface ActivityEvent {
   id: string;
   workspace_id: string;

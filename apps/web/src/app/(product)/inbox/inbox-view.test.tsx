@@ -10,12 +10,22 @@ import type {
   ConversationAnalysis,
   ConversationDetail,
   Integration,
+  MemberRole,
+  ReasonConversationRead,
 } from "@/lib/types";
 
 import { InboxView } from "./inbox-view";
 
 // A stable reference: a fresh object per call would re-run the load effect forever.
-const workspace = { id: "w1", name: "Acme", slug: "acme", created_at: "", role: "owner" as const };
+// `role` is mutated (not reassigned) by individual tests to exercise owner/member/admin
+// UX — reset in `beforeEach` so no test leaks its role into the next one.
+const workspace: { id: string; name: string; slug: string; created_at: string; role: MemberRole } = {
+  id: "w1",
+  name: "Acme",
+  slug: "acme",
+  created_at: "",
+  role: "owner",
+};
 vi.mock("@/lib/auth-context", () => ({ useAuth: () => ({ workspace }) }));
 
 // A stable reference (matching real Next.js): InboxView reads `?conversation=` to
@@ -159,6 +169,7 @@ describe("InboxView", () => {
     mockedApi.get.mockReset();
     mockedApi.post.mockReset();
     searchParams = new URLSearchParams();
+    workspace.role = "owner";
   });
 
   it("shows an empty state with a link to Settings when Gmail is not connected", async () => {
@@ -755,6 +766,424 @@ describe("InboxView", () => {
       expect(
         within(detailPane).getByText("Hi, can you send pricing for 3 seats?"),
       ).toBeInTheDocument();
+    });
+
+    // -------------------------------------------------------------------
+    // M8.3b: Suggest reply (reasoning)
+    // -------------------------------------------------------------------
+
+    describe("Suggest reply", () => {
+      function reasonResult(overrides: Partial<ReasonConversationRead> = {}): ReasonConversationRead {
+        return { outcome: "action_created", action: makeAction(), detail: null, ...overrides };
+      }
+
+      it("is visible as soon as a conversation is open, even with no Actions yet", async () => {
+        mockLoaded([]);
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+        expect(await screen.findByRole("button", { name: "Suggest reply" })).toBeInTheDocument();
+      });
+
+      it("calls exactly the /reason endpoint with no body", async () => {
+        mockLoaded([]);
+        mockedApi.post.mockResolvedValue(reasonResult({ outcome: "no_action", action: null }));
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+        await userEvent.click(await screen.findByRole("button", { name: "Suggest reply" }));
+
+        expect(mockedApi.post).toHaveBeenCalledWith("/v1/workspaces/w1/conversations/c1/reason");
+        expect(mockedApi.post).toHaveBeenCalledTimes(1);
+      });
+
+      it("disables the button and shows Thinking… while pending", async () => {
+        mockLoaded([]);
+        mockedApi.post.mockImplementation(() => new Promise(() => {}));
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+        const button = await screen.findByRole("button", { name: "Suggest reply" });
+
+        await userEvent.click(button);
+
+        await waitFor(() => expect(button).toHaveTextContent("Thinking…"));
+        expect(button).toBeDisabled();
+      });
+
+      it("never issues a second reason request while one is already pending", async () => {
+        mockLoaded([]);
+        mockedApi.post.mockImplementation(() => new Promise(() => {}));
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+        const button = await screen.findByRole("button", { name: "Suggest reply" });
+
+        await userEvent.click(button);
+        await userEvent.click(button);
+
+        expect(mockedApi.post).toHaveBeenCalledTimes(1);
+      });
+
+      it("ACTION_CREATED renders the returned proposal immediately, with no refetch", async () => {
+        mockLoaded([]);
+        mockedApi.post.mockResolvedValue(reasonResult());
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+        mockedApi.get.mockClear();
+
+        await userEvent.click(await screen.findByRole("button", { name: "Suggest reply" }));
+
+        expect(await screen.findByText("Suggested action")).toBeInTheDocument();
+        expect(screen.getByText("priya@halcyon.example")).toBeInTheDocument();
+        expect(mockedApi.get).not.toHaveBeenCalled();
+      });
+
+      it("ACTION_DUPLICATE upserts the returned Action without duplicating the card", async () => {
+        mockLoaded([makeAction()]);
+        mockedApi.post.mockResolvedValue(
+          reasonResult({ outcome: "action_duplicate", action: makeAction() }),
+        );
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+        expect(await screen.findAllByText("Suggested action")).toHaveLength(1);
+
+        await userEvent.click(await screen.findByRole("button", { name: "Suggest reply" }));
+
+        await waitFor(() => expect(mockedApi.post).toHaveBeenCalledTimes(1));
+        expect(screen.getAllByText("Suggested action")).toHaveLength(1);
+      });
+
+      it("NO_ACTION shows safe inline feedback and does not create an Action", async () => {
+        mockLoaded([]);
+        mockedApi.post.mockResolvedValue(reasonResult({ outcome: "no_action", action: null }));
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+        await userEvent.click(await screen.findByRole("button", { name: "Suggest reply" }));
+
+        expect(
+          await screen.findByText("Nerva doesn’t recommend an action right now."),
+        ).toBeInTheDocument();
+        expect(screen.queryByText("Suggested action")).not.toBeInTheDocument();
+      });
+
+      it("POLICY_REJECTED shows safe inline feedback and does not create an Action", async () => {
+        mockLoaded([]);
+        mockedApi.post.mockResolvedValue(reasonResult({ outcome: "policy_rejected", action: null }));
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+        await userEvent.click(await screen.findByRole("button", { name: "Suggest reply" }));
+
+        expect(
+          await screen.findByText("Nerva couldn’t create a safe suggestion."),
+        ).toBeInTheDocument();
+        expect(screen.queryByText("Suggested action")).not.toBeInTheDocument();
+      });
+
+      it.each([
+        [409, "analysis_not_ready", "Analyze this conversation first, then try Suggest reply."],
+        [
+          409,
+          "recipient_not_resolvable",
+          "Nerva couldn’t find a trusted recipient for this conversation.",
+        ],
+        [429, "rate_limited", "Nerva is busy right now — try again in a moment."],
+        [503, "ai_not_configured", "Reasoning isn’t available right now."],
+        [503, "ai_unavailable", "Couldn’t reach the AI provider — try again shortly."],
+        [503, "invalid_ai_output", "Nerva couldn’t produce a suggestion this time — try again."],
+      ])("maps %s %s to a safe message", async (status, code, message) => {
+        mockLoaded([]);
+        mockedApi.post.mockRejectedValue(
+          new ApiError(status, code, "backend technical message", { code }),
+        );
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+        await userEvent.click(await screen.findByRole("button", { name: "Suggest reply" }));
+
+        expect(await screen.findByText(message)).toBeInTheDocument();
+      });
+
+      it("a network failure shows a safe fallback and preserves existing Actions", async () => {
+        mockLoaded([makeAction()]);
+        mockedApi.post.mockRejectedValue(new Error("network"));
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+        await screen.findByText("Suggested action");
+
+        await userEvent.click(await screen.findByRole("button", { name: "Suggest reply" }));
+
+        expect(await screen.findByText("Couldn’t get a suggestion. Try again.")).toBeInTheDocument();
+        expect(screen.getByText("Suggested action")).toBeInTheDocument(); // untouched
+      });
+
+      it("clears previous feedback when a new Suggest reply attempt starts", async () => {
+        mockLoaded([]);
+        mockedApi.post
+          .mockResolvedValueOnce(reasonResult({ outcome: "no_action", action: null }))
+          .mockImplementationOnce(() => new Promise(() => {}));
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+        const button = await screen.findByRole("button", { name: "Suggest reply" });
+
+        await userEvent.click(button);
+        expect(
+          await screen.findByText("Nerva doesn’t recommend an action right now."),
+        ).toBeInTheDocument();
+
+        await userEvent.click(button);
+
+        await waitFor(() =>
+          expect(
+            screen.queryByText("Nerva doesn’t recommend an action right now."),
+          ).not.toBeInTheDocument(),
+        );
+      });
+
+      it("does not leak feedback across a conversation change", async () => {
+        const conversation2: Conversation = {
+          ...conversation,
+          id: "c2",
+          subject: "Second thread",
+          preview: "Hey there",
+        };
+        mockedApi.get.mockImplementation((path: string) => {
+          if (path.includes("actions?conversation_id")) return Promise.resolve([]);
+          return getByPath(path, {
+            "/conversations/c2": { conversation: conversation2, messages: [], analysis: null },
+            "/conversations/c1": detail,
+            integrations: [connectedIntegration],
+            conversations: [conversation, conversation2],
+            signals: [],
+          });
+        });
+        mockedApi.post.mockResolvedValue(reasonResult({ outcome: "no_action", action: null }));
+
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+        await userEvent.click(await screen.findByRole("button", { name: "Suggest reply" }));
+        expect(
+          await screen.findByText("Nerva doesn’t recommend an action right now."),
+        ).toBeInTheDocument();
+
+        await userEvent.click(await screen.findByText("Second thread"));
+
+        await waitFor(() =>
+          expect(
+            screen.queryByText("Nerva doesn’t recommend an action right now."),
+          ).not.toBeInTheDocument(),
+        );
+      });
+
+      it("never calls approve, reject or execute", async () => {
+        mockLoaded([]);
+        mockedApi.post.mockResolvedValue(reasonResult());
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+        await userEvent.click(await screen.findByRole("button", { name: "Suggest reply" }));
+
+        await waitFor(() => expect(mockedApi.post).toHaveBeenCalled());
+        for (const [path] of mockedApi.post.mock.calls) {
+          expect(path).toContain("/reason");
+        }
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // M8.3b: Send email (execution)
+    // -------------------------------------------------------------------
+
+    describe("Send email", () => {
+      it("APPROVED send_email + owner shows Send email", async () => {
+        mockLoaded([makeAction({ status: "approved" })]);
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+        expect(
+          await screen.findByRole("button", { name: "Send email: Reply to Priya with pricing" }),
+        ).toBeInTheDocument();
+      });
+
+      it("APPROVED send_email + member does not show Send email", async () => {
+        workspace.role = "member";
+        mockLoaded([makeAction({ status: "approved" })]);
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+        await screen.findByText("Approved");
+        expect(screen.queryByRole("button", { name: /^Send email:/ })).not.toBeInTheDocument();
+      });
+
+      it("APPROVED send_email + admin does not show Send email (backend requires owner)", async () => {
+        workspace.role = "admin";
+        mockLoaded([makeAction({ status: "approved" })]);
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+        await screen.findByText("Approved");
+        expect(screen.queryByRole("button", { name: /^Send email:/ })).not.toBeInTheDocument();
+      });
+
+      it("Send calls exactly the /execute endpoint with no body", async () => {
+        mockLoaded([makeAction({ status: "approved" })]);
+        mockedApi.post.mockResolvedValue(makeAction({ status: "completed" }));
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+        await userEvent.click(
+          await screen.findByRole("button", { name: "Send email: Reply to Priya with pricing" }),
+        );
+
+        expect(mockedApi.post).toHaveBeenCalledWith("/v1/workspaces/w1/actions/act1/execute");
+        expect(mockedApi.post).toHaveBeenCalledTimes(1);
+        expect(mockedApi.post.mock.calls[0]).toHaveLength(1); // path only — no body argument
+      });
+
+      it("disables Send and shows Sending… while pending", async () => {
+        mockLoaded([makeAction({ status: "approved" })]);
+        mockedApi.post.mockImplementation(() => new Promise(() => {}));
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+        const button = await screen.findByRole("button", {
+          name: "Send email: Reply to Priya with pricing",
+        });
+
+        await userEvent.click(button);
+
+        await waitFor(() => expect(button).toHaveTextContent("Sending…"));
+        expect(button).toBeDisabled();
+      });
+
+      it("a returned COMPLETED renders Sent, with no Send button", async () => {
+        mockLoaded([makeAction({ status: "approved" })]);
+        mockedApi.post.mockResolvedValue(
+          makeAction({ status: "completed", result: { external_reference_id: "msg_1" } }),
+        );
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+        await userEvent.click(
+          await screen.findByRole("button", { name: "Send email: Reply to Priya with pricing" }),
+        );
+
+        expect(await screen.findByText("Sent")).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: /^Send email:/ })).not.toBeInTheDocument();
+      });
+
+      it("a returned FAILED renders Failed to send, the safe error, and Go to Settings", async () => {
+        mockLoaded([makeAction({ status: "approved" })]);
+        mockedApi.post.mockResolvedValue(
+          makeAction({
+            status: "failed",
+            result: {
+              error:
+                "Gmail is connected without permission to send email; it needs to be reconnected.",
+            },
+          }),
+        );
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+        await userEvent.click(
+          await screen.findByRole("button", { name: "Send email: Reply to Priya with pricing" }),
+        );
+
+        expect(await screen.findByText("Failed to send")).toBeInTheDocument();
+        expect(
+          screen.getByText(
+            "Gmail is connected without permission to send email; it needs to be reconnected.",
+          ),
+        ).toBeInTheDocument();
+        expect(screen.getByRole("link", { name: "Go to Settings" })).toHaveAttribute(
+          "href",
+          "/settings",
+        );
+        expect(screen.queryByRole("button", { name: /^Send email:/ })).not.toBeInTheDocument();
+      });
+
+      it("an execute network failure preserves the prior APPROVED state and re-enables Send", async () => {
+        mockLoaded([makeAction({ status: "approved" })]);
+        mockedApi.post.mockRejectedValue(new Error("network"));
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+        await userEvent.click(
+          await screen.findByRole("button", { name: "Send email: Reply to Priya with pricing" }),
+        );
+
+        expect(await screen.findByText(/Couldn.t send this/)).toBeInTheDocument();
+        expect(
+          screen.getByRole("button", { name: "Send email: Reply to Priya with pricing" }),
+        ).toBeEnabled();
+      });
+
+      it("a 409 execute conflict refetches the authoritative Actions list and never auto-retries execute", async () => {
+        let getCalls = 0;
+        mockedApi.get.mockImplementation((path: string) => {
+          if (path.includes("actions?conversation_id")) {
+            getCalls += 1;
+            return Promise.resolve(
+              getCalls === 1
+                ? [makeAction({ status: "approved" })]
+                : [makeAction({ status: "rejected" })], // someone else decided it meanwhile
+            );
+          }
+          return getByPath(path, {
+            "/conversations/c1": detail,
+            integrations: [connectedIntegration],
+            conversations: [conversation],
+            signals: [],
+          });
+        });
+        mockedApi.post.mockRejectedValue(new ApiError(409, "not_executable", "not executable"));
+
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+        await userEvent.click(
+          await screen.findByRole("button", { name: "Send email: Reply to Priya with pricing" }),
+        );
+
+        expect(
+          await screen.findByText("This proposal is no longer ready to send."),
+        ).toBeInTheDocument();
+        await waitFor(() => expect(screen.getByText("Rejected")).toBeInTheDocument());
+        expect(getCalls).toBe(2); // the initial load, plus exactly one 409-triggered refetch
+        expect(mockedApi.post).toHaveBeenCalledTimes(1); // execute was never retried automatically
+      });
+
+      it("sending one Action does not disable or remove an unrelated Action", async () => {
+        mockLoaded([
+          makeAction({ id: "act1", summary: "First proposal", status: "approved" }),
+          makeAction({ id: "act2", summary: "Second proposal", status: "proposed" }),
+        ]);
+        mockedApi.post.mockImplementation(() => new Promise(() => {})); // first Send stays pending
+
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+        await userEvent.click(await screen.findByRole("button", { name: "Send email: First proposal" }));
+
+        expect(
+          await screen.findByRole("button", { name: "Approve: Second proposal" }),
+        ).toBeEnabled();
+        expect(screen.getByRole("button", { name: "Reject: Second proposal" })).toBeEnabled();
+      });
+
+      it("execute never calls /reason, /approve or /reject", async () => {
+        mockLoaded([makeAction({ status: "approved" })]);
+        mockedApi.post.mockResolvedValue(makeAction({ status: "completed" }));
+        render(<InboxView />);
+        await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+        await userEvent.click(
+          await screen.findByRole("button", { name: "Send email: Reply to Priya with pricing" }),
+        );
+
+        await waitFor(() => expect(screen.getByText("Sent")).toBeInTheDocument());
+        for (const [path] of mockedApi.post.mock.calls) {
+          expect(path).toContain("/execute");
+        }
+      });
     });
   });
 

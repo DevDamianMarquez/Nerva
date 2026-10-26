@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -31,6 +32,18 @@ function humanizeType(type: string): string {
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
+/** `STATUS_LABEL`, specialized for `send_email`'s two terminal states — the
+ * product-facing "Sent" / "Failed to send" the task calls for, rather than
+ * the generic "Completed" / "Failed" every other (future) action type still
+ * falls back to. */
+function statusLabel(action: Action): string {
+  if (action.type === "send_email") {
+    if (action.status === "completed") return "Sent";
+    if (action.status === "failed") return "Failed to send";
+  }
+  return STATUS_LABEL[action.status];
+}
+
 interface SendEmailDetails {
   recipients: string[];
   subject: string;
@@ -52,12 +65,31 @@ function parseSendEmailPayload(payload: Record<string, unknown>): SendEmailDetai
   return { recipients, subject, body };
 }
 
-type Decision = "approve" | "reject";
+type Decision = "approve" | "reject" | "execute";
 
 interface SuggestedActionProps {
   action: Action;
   onApprove: (action: Action) => Promise<void>;
   onReject: (action: Action) => Promise<void>;
+  /** Whether the current user is authorized to send this (owner-only on the
+   * backend — see `routes.actions.execute_action`). UX-only: hiding the
+   * button never substitutes for the backend's own 403, which remains the
+   * actual authorization boundary. */
+  canExecute: boolean;
+  onExecute: (action: Action) => Promise<void>;
+}
+
+function decisionErrorMessage(decision: Decision, err: unknown): string {
+  if (decision === "execute" && err instanceof ApiError) {
+    // Product-facing text distinct from the backend's own (more technical)
+    // message — see `routes.actions.execute_action`'s 403/409 mappings.
+    if (err.status === 403) return "Only the workspace owner can send this.";
+    if (err.status === 409) return "This proposal is no longer ready to send.";
+  }
+  if (err instanceof ApiError) return err.message;
+  return decision === "execute"
+    ? "Couldn’t send this. Try again."
+    : "Couldn’t save that decision. Try again.";
 }
 
 /** One proposed (or already-decided) Action shown for human review in a
@@ -67,16 +99,31 @@ interface SuggestedActionProps {
  * (never `dangerouslySetInnerHTML`, never interpreted as HTML/links), and a
  * shape this component does not recognize degrades to a safe fallback rather
  * than crashing. Recipient/subject/body are review-only — nothing here lets a
- * user edit them, and approving/rejecting only ever sends the action's `id`,
- * never its payload, to the backend (M8.2 adds no execute call and no
- * reasoning trigger; see `onApprove`/`onReject`'s callers). The backend
- * response is the only source of truth for the resulting status — this
- * component never guesses a transition locally. */
-export function SuggestedAction({ action, onApprove, onReject }: SuggestedActionProps) {
+ * user edit them, and approving/rejecting/executing only ever send the
+ * action's `id`, never its payload, to the backend; executing never calls
+ * `/reason` or `/approve`/`/reject` (see each prop's own caller in
+ * `InboxView`). The backend response is the only source of truth for the
+ * resulting status — this component never guesses a transition locally, and
+ * never shows a terminal state before the backend actually returns one. */
+export function SuggestedAction({
+  action,
+  onApprove,
+  onReject,
+  canExecute,
+  onExecute,
+}: SuggestedActionProps) {
   const [pending, setPending] = useState<Decision | null>(null);
   const [error, setError] = useState<string | null>(null);
   const typeLabel = humanizeType(action.type);
   const details = action.type === "send_email" ? parseSendEmailPayload(action.payload) : null;
+  // A malformed payload is an additional frontend safety gate, not a
+  // substitute for backend authorization: if the recipient/subject/body
+  // cannot be safely parsed and shown for review, Send is never offered,
+  // even when the backend status is already `approved`.
+  const canShowSend =
+    action.type === "send_email" && action.status === "approved" && canExecute && details !== null;
+  const resultError =
+    action.result && typeof action.result.error === "string" ? action.result.error : null;
 
   const decide = async (decision: Decision, run: (action: Action) => Promise<void>) => {
     if (pending) return; // a second click while one decision is in flight is a no-op
@@ -87,7 +134,7 @@ export function SuggestedAction({ action, onApprove, onReject }: SuggestedAction
       // On success the parent updates this action from the backend's own
       // response; there is nothing further to set here.
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Couldn’t save that decision. Try again.");
+      setError(decisionErrorMessage(decision, err));
     } finally {
       setPending(null);
     }
@@ -97,9 +144,7 @@ export function SuggestedAction({ action, onApprove, onReject }: SuggestedAction
     <div className="space-y-3 rounded-lg border border-dashed p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h3 className="text-sm font-semibold tracking-tight">Suggested action</h3>
-        <Badge variant={STATUS_BADGE_VARIANT[action.status]}>
-          {STATUS_LABEL[action.status]}
-        </Badge>
+        <Badge variant={STATUS_BADGE_VARIANT[action.status]}>{statusLabel(action)}</Badge>
       </div>
 
       <p className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">
@@ -133,6 +178,15 @@ export function SuggestedAction({ action, onApprove, onReject }: SuggestedAction
         <p className="text-sm break-words">{action.summary}</p>
       )}
 
+      {action.type === "send_email" && action.status === "failed" ? (
+        <div className="space-y-1.5 border-t pt-3 text-sm">
+          {resultError ? <p className="text-destructive">{resultError}</p> : null}
+          <Link href="/settings" className="font-medium underline underline-offset-2">
+            Go to Settings
+          </Link>
+        </div>
+      ) : null}
+
       {error ? (
         <p role="alert" className="text-xs text-destructive">
           {error}
@@ -157,6 +211,17 @@ export function SuggestedAction({ action, onApprove, onReject }: SuggestedAction
             onClick={() => void decide("approve", onApprove)}
           >
             {pending === "approve" ? "Approving…" : "Approve"}
+          </Button>
+        </div>
+      ) : canShowSend ? (
+        <div className="flex gap-2 pt-0.5">
+          <Button
+            size="sm"
+            disabled={pending !== null}
+            aria-label={`Send email: ${action.summary}`}
+            onClick={() => void decide("execute", onExecute)}
+          >
+            {pending === "execute" ? "Sending…" : "Send email"}
           </Button>
         </div>
       ) : null}

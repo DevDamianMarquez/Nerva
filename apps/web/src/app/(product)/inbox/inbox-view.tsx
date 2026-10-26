@@ -21,6 +21,7 @@ import type {
   ConversationAnalysis,
   ConversationDetail,
   Integration,
+  ReasonConversationRead,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -34,6 +35,43 @@ function formatTime(iso: string | null): string {
     hour: "numeric",
     minute: "2-digit",
   });
+}
+
+function errorCode(err: ApiError): string | undefined {
+  const details = err.details;
+  if (details && typeof details === "object" && "code" in details) {
+    const code = (details as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
+}
+
+/** Maps `/reason`'s own typed failures to safe, product-facing text — never
+ * the backend's raw message, which is written for an API consumer, not a
+ * reader. 401 and an unrecognized `code` (including a bare 404) fall through
+ * to the generic case, which is already safe (see `routes.conversations.
+ * reason_about_conversation`'s own error-mapping: nothing it raises ever
+ * carries provider output, a stack trace, or a config value). */
+function reasonErrorMessage(err: unknown): string {
+  if (err instanceof ApiError) {
+    switch (errorCode(err)) {
+      case "analysis_not_ready":
+        return "Analyze this conversation first, then try Suggest reply.";
+      case "recipient_not_resolvable":
+        return "Nerva couldn’t find a trusted recipient for this conversation.";
+      case "rate_limited":
+        return "Nerva is busy right now — try again in a moment.";
+      case "ai_not_configured":
+        return "Reasoning isn’t available right now.";
+      case "ai_unavailable":
+        return "Couldn’t reach the AI provider — try again shortly.";
+      case "invalid_ai_output":
+        return "Nerva couldn’t produce a suggestion this time — try again.";
+      default:
+        return err.message;
+    }
+  }
+  return "Couldn’t get a suggestion. Try again.";
 }
 
 function ConversationList({
@@ -97,7 +135,12 @@ function ConversationDetailPane({
   actionsState,
   onApproveAction,
   onRejectAction,
+  onExecuteAction,
   onRetryActions,
+  canExecute,
+  reasonPending,
+  reasonFeedback,
+  onSuggestReply,
 }: {
   state: LoadState;
   detail: ConversationDetail | null;
@@ -113,7 +156,12 @@ function ConversationDetailPane({
   actionsState: LoadState;
   onApproveAction: (action: Action) => Promise<void>;
   onRejectAction: (action: Action) => Promise<void>;
+  onExecuteAction: (action: Action) => Promise<void>;
   onRetryActions: () => void;
+  canExecute: boolean;
+  reasonPending: boolean;
+  reasonFeedback: string | null;
+  onSuggestReply: () => void;
 }) {
   if (state === "loading") {
     return <p className="p-8 text-center text-muted-foreground">Loading…</p>;
@@ -176,28 +224,44 @@ function ConversationDetailPane({
         ))}
       </ul>
 
-      {/* Zero Actions is a normal state (most conversations have none) — nothing
-          renders here at all in that case, not an empty-state message. A failure
-          to load Actions is isolated to this section: it never blocks or hides
-          the messages/analysis above. */}
-      {actionsState === "loading" || actionsState === "error" || actions.length > 0 ? (
-        <div className="space-y-4 border-t p-4 sm:p-6">
-          {actionsState === "loading" ? (
-            <p className="text-sm text-muted-foreground">Loading…</p>
-          ) : actionsState === "error" ? (
-            <LoadError onRetry={onRetryActions} />
-          ) : (
-            actions.map((action) => (
-              <SuggestedAction
-                key={action.id}
-                action={action}
-                onApprove={onApproveAction}
-                onReject={onRejectAction}
-              />
-            ))
-          )}
+      {/* Suggest reply is always visible once a conversation is open — it does
+          not depend on a client-side guess about analysis/recipient readiness
+          (see `reasonErrorMessage`'s own docstring); the backend's 409s drive
+          that feedback instead. Zero Actions is otherwise still a normal state
+          (most conversations have none): no scary empty-state message, just no
+          cards. A failure to load existing Actions is isolated to this
+          section — it never blocks or hides the messages/analysis above. */}
+      <div className="space-y-4 border-t p-4 sm:p-6">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-sm font-semibold tracking-tight">Suggested actions</h3>
+          <Button variant="outline" size="sm" disabled={reasonPending} onClick={onSuggestReply}>
+            {reasonPending ? "Thinking…" : "Suggest reply"}
+          </Button>
         </div>
-      ) : null}
+
+        {reasonFeedback ? (
+          <p role="status" className="text-sm text-muted-foreground">
+            {reasonFeedback}
+          </p>
+        ) : null}
+
+        {actionsState === "loading" ? (
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        ) : actionsState === "error" ? (
+          <LoadError onRetry={onRetryActions} />
+        ) : (
+          actions.map((action) => (
+            <SuggestedAction
+              key={action.id}
+              action={action}
+              onApprove={onApproveAction}
+              onReject={onRejectAction}
+              canExecute={canExecute}
+              onExecute={onExecuteAction}
+            />
+          ))
+        )}
+      </div>
     </section>
   );
 }
@@ -216,6 +280,8 @@ export function InboxView() {
   const [pendingSignals, setPendingSignals] = useState<BusinessSignal[]>([]);
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState<string | null>(null);
+  const [reasonPending, setReasonPending] = useState(false);
+  const [reasonFeedback, setReasonFeedback] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!workspace) return;
@@ -265,6 +331,9 @@ export function InboxView() {
       if (!workspace) return;
       setSelectedId(id);
       setAnalyzeError(null);
+      // Reasoning feedback belongs to one conversation at a time — never carry
+      // a stale "no suggestion"/error message over to the next one opened.
+      setReasonFeedback(null);
       setDetailState("loading");
       void (async () => {
         try {
@@ -347,6 +416,62 @@ export function InboxView() {
       `/v1/workspaces/${workspace.id}/actions/${action.id}/${decision}`,
     );
     setActions((current) => current.map((a) => (a.id === updated.id ? updated : a)));
+  };
+
+  // Send email: calls only `/execute` with the action's id, nothing else —
+  // never `/reason`, never `/approve`/`/reject`, and never the recipient/
+  // subject/body (the backend's own stored, already-approved payload is the
+  // only thing ever sent). Synchronous: the single response already carries
+  // the terminal `completed`/`failed` state (see `nerva_actions.engine`), so
+  // this never polls or optimistically marks anything "sent" beforehand.
+  const executeAction = async (action: Action) => {
+    if (!workspace) return;
+    try {
+      const updated = await api.post<Action>(
+        `/v1/workspaces/${workspace.id}/actions/${action.id}/execute`,
+      );
+      setActions((current) => current.map((a) => (a.id === updated.id ? updated : a)));
+    } catch (err) {
+      // A 409 means this component's local Action state is stale (someone/
+      // something else already moved it out of `approved`) — refetch the
+      // authoritative list for this conversation rather than guessing.
+      // `SuggestedAction` still shows a safe message from the error below;
+      // this call never retries `/execute` itself.
+      if (err instanceof ApiError && err.status === 409 && selectedId) {
+        void loadActions(selectedId);
+      }
+      throw err;
+    }
+  };
+
+  const suggestReply = async () => {
+    if (!workspace || !selectedId || reasonPending) return;
+    setReasonPending(true);
+    setReasonFeedback(null);
+    try {
+      const result = await api.post<ReasonConversationRead>(
+        `/v1/workspaces/${workspace.id}/conversations/${selectedId}/reason`,
+      );
+      if (result.action) {
+        const created = result.action;
+        setActions((current) =>
+          current.some((a) => a.id === created.id)
+            ? current.map((a) => (a.id === created.id ? created : a))
+            : [created, ...current],
+        );
+      }
+      if (result.outcome === "no_action") {
+        setReasonFeedback("Nerva doesn’t recommend an action right now.");
+      } else if (result.outcome === "policy_rejected") {
+        setReasonFeedback("Nerva couldn’t create a safe suggestion.");
+      }
+      // action_created / action_duplicate: the proposal itself, now visible
+      // in the list above, is the feedback — no extra banner needed.
+    } catch (err) {
+      setReasonFeedback(reasonErrorMessage(err));
+    } finally {
+      setReasonPending(false);
+    }
   };
 
   if (!workspace) return null;
@@ -451,7 +576,12 @@ export function InboxView() {
             actionsState={actionsState}
             onApproveAction={(action) => decideAction(action, "approve")}
             onRejectAction={(action) => decideAction(action, "reject")}
+            onExecuteAction={executeAction}
             onRetryActions={() => void loadActions(selectedId)}
+            canExecute={workspace.role === "owner"}
+            reasonPending={reasonPending}
+            reasonFeedback={reasonFeedback}
+            onSuggestReply={() => void suggestReply()}
           />
         ) : (
           <div className="hidden min-w-0 flex-1 items-center justify-center text-muted-foreground sm:flex">
