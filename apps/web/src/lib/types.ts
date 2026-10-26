@@ -59,6 +59,10 @@ export interface Action {
   id: string;
   workspace_id: string;
   opportunity_id: string | null;
+  /** The conversation this proposal was reasoned from. `null` for a
+   * human-proposed action, or for an automatic action type that is not
+   * conversation-sourced (see `GET .../actions?conversation_id=`). */
+  conversation_id: string | null;
   type: string;
   status: ActionStatus;
   summary: string;

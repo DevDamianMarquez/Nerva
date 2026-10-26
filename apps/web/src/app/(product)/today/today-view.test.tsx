@@ -23,6 +23,7 @@ const action: Action = {
   id: "a1",
   workspace_id: "w1",
   opportunity_id: null,
+  conversation_id: null,
   type: "send_email",
   status: "proposed",
   summary: "Send follow-up",

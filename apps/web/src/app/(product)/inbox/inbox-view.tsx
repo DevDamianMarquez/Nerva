@@ -7,6 +7,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { EmptyState } from "@/components/empty-state";
 import { NervaUnderstanding } from "@/components/inbox/nerva-understanding";
+import { SuggestedAction } from "@/components/inbox/suggested-action";
 import { LoadError } from "@/components/load-error";
 import { PageContainer, PageHeader } from "@/components/page-header";
 import { PotentialOpportunityCard } from "@/components/signals/potential-opportunity-card";
@@ -14,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { api, ApiError } from "@/lib/api-client";
 import { useAuth } from "@/lib/auth-context";
 import type {
+  Action,
   BusinessSignal,
   Conversation,
   ConversationAnalysis,
@@ -91,6 +93,11 @@ function ConversationDetailPane({
   onDismissSignal,
   onBack,
   onRetry,
+  actions,
+  actionsState,
+  onApproveAction,
+  onRejectAction,
+  onRetryActions,
 }: {
   state: LoadState;
   detail: ConversationDetail | null;
@@ -102,6 +109,11 @@ function ConversationDetailPane({
   onDismissSignal: (signal: BusinessSignal) => Promise<void>;
   onBack: () => void;
   onRetry: () => void;
+  actions: readonly Action[];
+  actionsState: LoadState;
+  onApproveAction: (action: Action) => Promise<void>;
+  onRejectAction: (action: Action) => Promise<void>;
+  onRetryActions: () => void;
 }) {
   if (state === "loading") {
     return <p className="p-8 text-center text-muted-foreground">Loading…</p>;
@@ -163,6 +175,29 @@ function ConversationDetailPane({
           </li>
         ))}
       </ul>
+
+      {/* Zero Actions is a normal state (most conversations have none) — nothing
+          renders here at all in that case, not an empty-state message. A failure
+          to load Actions is isolated to this section: it never blocks or hides
+          the messages/analysis above. */}
+      {actionsState === "loading" || actionsState === "error" || actions.length > 0 ? (
+        <div className="space-y-4 border-t p-4 sm:p-6">
+          {actionsState === "loading" ? (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : actionsState === "error" ? (
+            <LoadError onRetry={onRetryActions} />
+          ) : (
+            actions.map((action) => (
+              <SuggestedAction
+                key={action.id}
+                action={action}
+                onApprove={onApproveAction}
+                onReject={onRejectAction}
+              />
+            ))
+          )}
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -176,6 +211,8 @@ export function InboxView() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
   const [detailState, setDetailState] = useState<LoadState>("ready");
+  const [actions, setActions] = useState<Action[]>([]);
+  const [actionsState, setActionsState] = useState<LoadState>("ready");
   const [pendingSignals, setPendingSignals] = useState<BusinessSignal[]>([]);
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState<string | null>(null);
@@ -202,23 +239,47 @@ export function InboxView() {
     void Promise.resolve().then(load);
   }, [load]);
 
+  // Independent of the conversation-detail fetch: a conversation with no
+  // Actions (the common case) is a normal, non-error state (see
+  // `ConversationDetailPane`'s own rendering), and a failure here must never
+  // block or hide messages/analysis that already loaded successfully.
+  const loadActions = useCallback(
+    async (conversationId: string) => {
+      if (!workspace) return;
+      setActionsState("loading");
+      try {
+        const found = await api.get<Action[]>(
+          `/v1/workspaces/${workspace.id}/actions?conversation_id=${conversationId}`,
+        );
+        setActions(found);
+        setActionsState("ready");
+      } catch {
+        setActionsState("error");
+      }
+    },
+    [workspace],
+  );
+
   const selectConversation = useCallback(
-    async (id: string) => {
+    (id: string) => {
       if (!workspace) return;
       setSelectedId(id);
       setAnalyzeError(null);
       setDetailState("loading");
-      try {
-        const found = await api.get<ConversationDetail>(
-          `/v1/workspaces/${workspace.id}/conversations/${id}`,
-        );
-        setDetail(found);
-        setDetailState("ready");
-      } catch {
-        setDetailState("error");
-      }
+      void (async () => {
+        try {
+          const found = await api.get<ConversationDetail>(
+            `/v1/workspaces/${workspace.id}/conversations/${id}`,
+          );
+          setDetail(found);
+          setDetailState("ready");
+        } catch {
+          setDetailState("error");
+        }
+      })();
+      void loadActions(id);
     },
-    [workspace],
+    [workspace, loadActions],
   );
 
   // Today's "Needs your attention" links here as `?conversation=<id>`; open that
@@ -271,6 +332,21 @@ export function InboxView() {
     if (!workspace) return;
     await api.post(`/v1/workspaces/${workspace.id}/signals/${signal.id}/dismiss`);
     setPendingSignals((current) => current.filter((s) => s.id !== signal.id));
+  };
+
+  // Approve/reject only ever call the backend's own `/approve`/`/reject`
+  // endpoints with the action's id — never `/execute`, never `/reason`, and
+  // never a payload. The updated row in the response (never a locally-guessed
+  // status) is what replaces this action in state; a failure leaves the
+  // previous authoritative action untouched (the `catch` in
+  // `SuggestedAction` is what actually shows the error and re-enables its
+  // buttons — this function simply lets that rejection propagate).
+  const decideAction = async (action: Action, decision: "approve" | "reject") => {
+    if (!workspace) return;
+    const updated = await api.post<Action>(
+      `/v1/workspaces/${workspace.id}/actions/${action.id}/${decision}`,
+    );
+    setActions((current) => current.map((a) => (a.id === updated.id ? updated : a)));
   };
 
   if (!workspace) return null;
@@ -371,6 +447,11 @@ export function InboxView() {
             onDismissSignal={dismissSignal}
             onBack={() => setSelectedId(null)}
             onRetry={() => void selectConversation(selectedId)}
+            actions={actions}
+            actionsState={actionsState}
+            onApproveAction={(action) => decideAction(action, "approve")}
+            onRejectAction={(action) => decideAction(action, "reject")}
+            onRetryActions={() => void loadActions(selectedId)}
           />
         ) : (
           <div className="hidden min-w-0 flex-1 items-center justify-center text-muted-foreground sm:flex">

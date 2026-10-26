@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { api, ApiError } from "@/lib/api-client";
 import type {
+  Action,
   BusinessSignal,
   Conversation,
   ConversationAnalysis,
@@ -205,6 +206,7 @@ describe("InboxView", () => {
     mockedApi.get.mockImplementation((path: string) =>
       getByPath(path, {
         "/conversations/c1": detail,
+        "actions?conversation_id": [],
         integrations: [connectedIntegration],
         conversations: [conversation],
         signals: [],
@@ -230,6 +232,7 @@ describe("InboxView", () => {
           messages: [{ ...detail.messages[0], body_text: htmlLookingBody }],
           analysis: null,
         },
+        "actions?conversation_id": [],
         integrations: [connectedIntegration],
         conversations: [conversation],
         signals: [],
@@ -270,6 +273,7 @@ describe("InboxView", () => {
           ],
           analysis: null,
         },
+        "actions?conversation_id": [],
         integrations: [connectedIntegration],
         conversations: [conversation],
         signals: [],
@@ -287,6 +291,7 @@ describe("InboxView", () => {
       mockedApi.get.mockImplementation((path: string) =>
         getByPath(path, {
           "/conversations/c1": detailOverride,
+          "actions?conversation_id": [],
           integrations: [connectedIntegration],
           conversations: [conversation],
           signals,
@@ -481,11 +486,284 @@ describe("InboxView", () => {
     });
   });
 
+  describe("Suggested actions", () => {
+    function makeAction(overrides: Partial<Action> = {}): Action {
+      return {
+        id: "act1",
+        workspace_id: "w1",
+        opportunity_id: null,
+        conversation_id: "c1",
+        type: "send_email",
+        status: "proposed",
+        summary: "Reply to Priya with pricing",
+        payload: {
+          recipients: ["priya@halcyon.example"],
+          subject: "Re: Pricing for 3 seats",
+          body: "Hi Priya,\nHere is the pricing you asked about.",
+        },
+        result: null,
+        created_by_type: "nerva",
+        created_by_user_id: null,
+        approved_by_user_id: null,
+        approved_at: null,
+        rejected_by_user_id: null,
+        rejected_at: null,
+        rejection_reason: null,
+        started_at: null,
+        finished_at: null,
+        created_at: "2024-01-02T11:05:00Z",
+        updated_at: "2024-01-02T11:05:00Z",
+        ...overrides,
+      };
+    }
+
+    function mockLoaded(actions: Action[] | (() => Promise<Action[]>)) {
+      mockedApi.get.mockImplementation((path: string) => {
+        if (path.includes("actions?conversation_id")) {
+          return typeof actions === "function" ? actions() : Promise.resolve(actions);
+        }
+        return getByPath(path, {
+          "/conversations/c1": detail,
+          integrations: [connectedIntegration],
+          conversations: [conversation],
+          signals: [],
+        });
+      });
+    }
+
+    it("fetches Actions scoped to the open conversation", async () => {
+      mockLoaded([makeAction()]);
+
+      render(<InboxView />);
+      await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+      await screen.findByText("Suggested action");
+      expect(mockedApi.get).toHaveBeenCalledWith(
+        "/v1/workspaces/w1/actions?conversation_id=c1",
+      );
+    });
+
+    it("a conversation with no Actions remains fully usable", async () => {
+      mockLoaded([]);
+
+      render(<InboxView />);
+      await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+      const detailPane = await screen.findByRole("region", { name: "Conversation" });
+
+      // Messages still render — no scary error for the common "nothing proposed" case.
+      await waitFor(() =>
+        expect(
+          within(detailPane).getByText("Hi, can you send pricing for 3 seats?"),
+        ).toBeInTheDocument(),
+      );
+      expect(screen.queryByText("Suggested action")).not.toBeInTheDocument();
+      expect(screen.queryByText(/Couldn.t load this/)).not.toBeInTheDocument();
+    });
+
+    it("shows a loading state for Actions without blocking the rest of the page", async () => {
+      mockLoaded(() => new Promise<Action[]>(() => {})); // never resolves
+
+      render(<InboxView />);
+      await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+      const detailPane = await screen.findByRole("region", { name: "Conversation" });
+
+      await waitFor(() =>
+        expect(
+          within(detailPane).getByText("Hi, can you send pricing for 3 seats?"),
+        ).toBeInTheDocument(),
+      );
+      expect(await screen.findByText("Loading…")).toBeInTheDocument();
+    });
+
+    it("a failed Actions request shows a local retry, and never hides messages/analysis", async () => {
+      mockLoaded(() => Promise.reject(new Error("network")));
+
+      render(<InboxView />);
+      await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+      const detailPane = await screen.findByRole("region", { name: "Conversation" });
+
+      expect(
+        await within(detailPane).findByText("Hi, can you send pricing for 3 seats?"),
+      ).toBeInTheDocument();
+      expect(screen.getByText(/Couldn.t load this/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    });
+
+    it("renders a proposed send_email with recipient, subject, body and both decisions", async () => {
+      mockLoaded([makeAction()]);
+
+      render(<InboxView />);
+      await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+      expect(await screen.findByText("priya@halcyon.example")).toBeInTheDocument();
+      expect(screen.getByText("Re: Pricing for 3 seats")).toBeInTheDocument();
+      expect(
+        screen.getByText(/Here is the pricing you asked about\./),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: "Approve: Reply to Priya with pricing" }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: "Reject: Reply to Priya with pricing" }),
+      ).toBeInTheDocument();
+    });
+
+    it("renders every Action when the conversation has more than one", async () => {
+      mockLoaded([
+        makeAction({ id: "act1", summary: "First proposal", status: "proposed" }),
+        makeAction({ id: "act2", summary: "Second proposal", status: "approved" }),
+      ]);
+
+      render(<InboxView />);
+      await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+
+      expect(await screen.findAllByText("Suggested action")).toHaveLength(2);
+      expect(
+        screen.getByRole("button", { name: "Approve: First proposal" }),
+      ).toBeInTheDocument();
+      expect(screen.getByText("Approved")).toBeInTheDocument(); // the second, already decided
+      // The already-decided proposal keeps no decision buttons for itself.
+      expect(
+        screen.queryByRole("button", { name: /Approve: Second proposal/ }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("approving calls the backend's approve endpoint and reflects the returned state", async () => {
+      mockLoaded([makeAction()]);
+      mockedApi.post.mockResolvedValue(makeAction({ status: "approved" }));
+
+      render(<InboxView />);
+      await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Approve: Reply to Priya with pricing" }),
+      );
+
+      expect(mockedApi.post).toHaveBeenCalledWith("/v1/workspaces/w1/actions/act1/approve");
+      expect(await screen.findByText("Approved")).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Approve: Reply to Priya with pricing" }),
+      ).not.toBeInTheDocument();
+      // The proposal's own content remains visible after the decision.
+      expect(screen.getByText("Re: Pricing for 3 seats")).toBeInTheDocument();
+    });
+
+    it("rejecting calls the backend's reject endpoint and reflects the returned state", async () => {
+      mockLoaded([makeAction()]);
+      mockedApi.post.mockResolvedValue(makeAction({ status: "rejected" }));
+
+      render(<InboxView />);
+      await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Reject: Reply to Priya with pricing" }),
+      );
+
+      expect(mockedApi.post).toHaveBeenCalledWith("/v1/workspaces/w1/actions/act1/reject");
+      expect(await screen.findByText("Rejected")).toBeInTheDocument();
+    });
+
+    it("a failed approval keeps the previous proposal visible with its buttons re-enabled", async () => {
+      mockLoaded([makeAction()]);
+      mockedApi.post.mockRejectedValue(new Error("network"));
+
+      render(<InboxView />);
+      await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Approve: Reply to Priya with pricing" }),
+      );
+
+      expect(await screen.findByText(/Couldn.t save that decision/)).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: "Approve: Reply to Priya with pricing" }),
+      ).toBeEnabled();
+      expect(screen.getByText("Re: Pricing for 3 seats")).toBeInTheDocument();
+    });
+
+    it("a failed rejection keeps the previous proposal visible", async () => {
+      mockLoaded([makeAction()]);
+      mockedApi.post.mockRejectedValue(new Error("network"));
+
+      render(<InboxView />);
+      await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Reject: Reply to Priya with pricing" }),
+      );
+
+      expect(await screen.findByText(/Couldn.t save that decision/)).toBeInTheDocument();
+      expect(screen.getByText("Re: Pricing for 3 seats")).toBeInTheDocument();
+    });
+
+    it("disables both buttons while a decision request is in flight", async () => {
+      mockLoaded([makeAction()]);
+      mockedApi.post.mockImplementation(() => new Promise(() => {})); // never resolves
+
+      render(<InboxView />);
+      await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+      const approveButton = await screen.findByRole("button", {
+        name: "Approve: Reply to Priya with pricing",
+      });
+      await userEvent.click(approveButton);
+
+      await waitFor(() => expect(approveButton).toBeDisabled());
+      expect(
+        screen.getByRole("button", { name: "Reject: Reply to Priya with pricing" }),
+      ).toBeDisabled();
+    });
+
+    it("never calls execute or reason when approving or rejecting", async () => {
+      mockLoaded([makeAction()]);
+      mockedApi.post.mockResolvedValue(makeAction({ status: "approved" }));
+
+      render(<InboxView />);
+      await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Approve: Reply to Priya with pricing" }),
+      );
+      await waitFor(() => expect(screen.getByText("Approved")).toBeInTheDocument());
+
+      for (const [path] of mockedApi.post.mock.calls) {
+        expect(path).not.toContain("/execute");
+        expect(path).not.toContain("/reason");
+      }
+    });
+
+    it("an unknown Action type does not crash the conversation page", async () => {
+      mockLoaded([
+        makeAction({
+          type: "update_opportunity_stage",
+          payload: { target_stage: "qualified" },
+        }),
+      ]);
+
+      render(<InboxView />);
+      await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+      const detailPane = await screen.findByRole("region", { name: "Conversation" });
+
+      expect(await screen.findByText("Suggested action")).toBeInTheDocument();
+      expect(
+        within(detailPane).getByText("Hi, can you send pricing for 3 seats?"),
+      ).toBeInTheDocument();
+    });
+
+    it("a malformed send_email payload does not crash the conversation page", async () => {
+      mockLoaded([makeAction({ payload: { subject: 123, body: null } })]);
+
+      render(<InboxView />);
+      await userEvent.click(await screen.findByText("Pricing for 3 seats"));
+      const detailPane = await screen.findByRole("region", { name: "Conversation" });
+
+      expect(await screen.findByText("Suggested action")).toBeInTheDocument();
+      expect(
+        within(detailPane).getByText("Hi, can you send pricing for 3 seats?"),
+      ).toBeInTheDocument();
+    });
+  });
+
   it("auto-opens the conversation named by ?conversation= (from Today's attention list)", async () => {
     searchParams = new URLSearchParams("conversation=c1");
     mockedApi.get.mockImplementation((path: string) =>
       getByPath(path, {
         "/conversations/c1": detail,
+        "actions?conversation_id": [],
         integrations: [connectedIntegration],
         conversations: [conversation],
         signals: [],
